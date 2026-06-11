@@ -1,3 +1,4 @@
+<!-- /autoplan restore point: ~/.gstack/projects/InsightExtension/master-autoplan-restore-20260611-123741.md -->
 # Insight Specialty Pharmacy Extension — V1 Build Specification
 
 This document is a complete build specification for Claude Code to execute in terminal. Read top-to-bottom. Follow the architecture, file structure, schema, API contracts, and build order exactly.
