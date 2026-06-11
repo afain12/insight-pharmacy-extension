@@ -39,7 +39,7 @@ The uploaded file carries `internal_status` (REQUIRED). The backend maps interna
 
 Lives in `packages/shared/src/statuses.ts`, consumed by backend and both frontends:
 
-| Canonical status | Phase | Chip bucket | Chip color | needsAction default | Explanation (provider-facing) |
+| Canonical status | Phase | Chip bucket | Chip color | Typical needs-action source (informational — §1.4 predicate is the ONLY source of truth) | Explanation (provider-facing) |
 |---|---|---|---|---|---|
 | Physician enrollment pending | Submission | All | neutral | per owner | Provider setup (CDTM agreement) is not yet complete for this prescriber. Insight will reach out if anything is needed from your office. |
 | Referral received | Submission | All | neutral | no | Insight has received this patient's referral and it is being processed. |
@@ -79,7 +79,7 @@ Colors: neutral `#6B7280`, amber `#F59E0B`, indigo `#4F46E5`, emerald `#10B981`,
 | Database | PostgreSQL | 15 (docker image `postgres:15`) |
 | ORM | Prisma | 5.x |
 | Auth | SuperTokens — `supertokens-node` 18.x, `supertokens-web-js` 0.13.x (extension+web view), `supertokens-auth-react` 0.48.x (internal tool); core: `supertokens/supertokens-postgresql` docker image (dev), self-hosted or managed core (prod). **Never `try.supertokens.io`.** |
-| File parsing | `csv-parse` 5.x (CSV), **`exceljs` 4.x** (XLSX — replaces v0.2's `xlsx`, which is frozen at 0.18.5 on npm with CVE-2023-30533 + CVE-2024-22363) |
+| File parsing | `csv-parse` 5.x (CSV), **`exceljs` 4.x** (XLSX — replaces v0.2's `xlsx`, which is frozen at 0.18.5 on npm with CVE-2023-30533 + CVE-2024-22363), `iconv-lite` 0.6.x (Windows-1252 fallback decode), `yauzl` 3.x (XLSX zip-entry inspection / bomb guard) |
 | Validation | zod 3.x |
 | Rate limiting | express-rate-limit 7.x |
 | Email | nodemailer 6.x (SMTP via env) |
@@ -98,7 +98,7 @@ Packages per workspace are enumerated in §19 Step 1. Commit `pnpm-lock.yaml`.
 insight-pharmacy-extension/
 ├── pnpm-workspace.yaml
 ├── package.json                      # root scripts: dev, db:setup, db:migrate, seed:*, test, smoke, build:extension
-├── docker-compose.yml                # postgres:15 + supertokens core + supertokens' own pg database
+├── docker-compose.yml                # postgres:15 + supertokens core (+ its own pg database) + mailpit (SMTP :1025, UI :8025)
 ├── .env.example                      # zero placeholders — works as-is for local dev
 ├── .gitignore
 ├── README.md                         # quick start, env table, scripts, extension load procedure, troubleshooting
@@ -153,7 +153,7 @@ insight-pharmacy-extension/
 
 ### 4.1 Backend SuperTokens init (`supertokens.ts`)
 
-Recipes: `EmailPassword.init()` with `signUpPOST: undefined` (public signup disabled) **and password-reset APIs overridden to `undefined`** (resets are admin-issued temp passwords, §6.3 — no email delivery is configured, so the public flow must not exist). `Session.init()` with claim minting:
+Recipes: `EmailPassword.init()` with **`override.apis`** setting `signUpPOST: undefined` and the password-reset APIs (`generatePasswordResetTokenPOST`, `passwordResetPOST`) to `undefined`. This disables only the public HTTP APIs — **the recipe FUNCTIONS (`EmailPassword.signUp`, `updateEmailOrPassword`) remain available and are exactly what admin provisioning (§6.1) and temp-password reset (§6.3) call server-side.** `Session.init()` with claim minting:
 
 ```typescript
 // Session claims are minted FAIL-CLOSED at login AND refresh.
@@ -172,11 +172,15 @@ async function buildClaims(supertokensId: string) {
   };
 }
 
-// createNewSession override: claims = await buildClaims(userId);
-//   if claims === null → throw new Error("PROVISIONING_INCOMPLETE") (login fails, 401)
+// The fail-closed check lives in the signInPOST API override (NOT a thrown generic
+// error from createNewSession, which SuperTokens would surface as a 500):
+//   signInPOST override: call original; on status "OK", check buildClaims(user.id);
+//   if null → revoke the just-created session and return
+//   { status: "WRONG_CREDENTIALS_ERROR" } (client shows the normal login failure).
+// createNewSession override: merge claims into accessTokenPayload when non-null.
 // refresh override (functions.refreshSession wrapper): re-mint claims the same way;
-//   null → revoke session. Role/account changes therefore take effect at next refresh,
-//   deactivation takes effect immediately via resolveLocalUser (4.2).
+//   null → revoke session (next request 401s). Role/account changes therefore take
+//   effect at next refresh; deactivation takes effect immediately via resolveLocalUser (4.2).
 ```
 
 ### 4.2 `resolveLocalUser` middleware (after `verifySession()` on every protected route)
@@ -201,15 +205,27 @@ if (role === "PROVIDER_STAFF") {
 
 The patients service MUST assert `scopedAccountId` is a non-empty string before any query. `where: { accountId: undefined }` in Prisma silently drops the filter — that failure mode is why every guard above exists, and §18 ships a test for each.
 
-### 4.4 Clients
+### 4.4 Clients (explicit init configs)
 
-- **Extension (MV3 popup):** `supertokens-web-js`, `tokenTransferMethod: "header"`. API base + apiDomain from `import.meta.env.VITE_API_DOMAIN`.
-- **Web view (same React app, built with `VITE_TARGET=web`):** default cookie transfer; served at its own URL; identical components.
-- **Internal tool:** `supertokens-auth-react` prebuilt UI, cookie transfer.
+- **Extension (MV3 popup):** `supertokens-web-js` — `appInfo: { appName, apiDomain: import.meta.env.VITE_API_DOMAIN, apiBasePath: "/auth" }`, `Session.init({ tokenTransferMethod: "header" })`, `EmailPassword.init()`. No cookies; tokens live in extension-scoped storage managed by the SDK.
+- **Web view (same React app, `VITE_TARGET=web`):** identical init but `tokenTransferMethod: "cookie"` (default).
+- **Internal tool:** `supertokens-auth-react` prebuilt UI — `appInfo: { apiDomain, websiteDomain: INTERNAL_TOOL_ORIGIN, apiBasePath: "/auth", websiteBasePath: "/auth" }`, cookie transfer.
 
-### 4.5 Express wiring order
+**Cookie/site topology (binding):** dev — all web clients run on `localhost` ports (5173/5174) against `localhost:3001`; same host = same site, so default `sameSite=lax` cookies work over HTTP. Prod — all three web surfaces MUST be subdomains of one registrable domain (e.g. `api.insightrx.example`, `app.…`, `admin.…`) so `sameSite=lax; secure` works. Cross-site hosting (different registrable domains) is NOT supported in V1 — it would require `SameSite=None` and is explicitly out of scope. The extension is unaffected (header transfer).
 
-`cors({ origin: ALLOWED_ORIGINS, allowedHeaders: ["content-type", "x-account-id", ...supertokens.getAllCORSHeaders()], credentials: true })` → SuperTokens `middleware()` → rate limiters (§4.6) → `express.json()` → routes (multer route-level on /upload) → SuperTokens `errorHandler()`. `ALLOWED_ORIGINS` is an env CSV: internal tool origin, web view origin, extension origin (deterministic — §11).
+### 4.5 Express wiring order (exact)
+
+```typescript
+app.use(cors({ origin: ALLOWED_ORIGINS, allowedHeaders: ["content-type", "x-account-id", ...supertokens.getAllCORSHeaders()], credentials: true }));
+app.use("/auth", authRateLimiter);          // 10 req/min/IP — BEFORE the ST middleware that serves /auth/*
+app.use(middleware());                       // SuperTokens — parses its own bodies; must come before express.json()
+app.use(express.json());
+app.post("/api/v1/upload", verifySession(), resolveLocalUser, requireRole([...]), uploadRateLimiter, multerSingle, uploadHandler);
+// ...remaining /api/v1 routes...
+app.use(errorHandler());                     // SuperTokens error handler LAST
+```
+
+`ALLOWED_ORIGINS` is an env CSV: internal tool origin, web view origin, extension origin (deterministic — §11).
 
 ### 4.6 Rate limits & session policy
 
@@ -274,6 +290,7 @@ model User {
   accounts      UserAccount[]
   fileBatches   FileBatch[]
   auditLogs     AuditLog[]
+  adoptionEvents AdoptionEvent[]
 }
 
 model UserAccount {
@@ -308,6 +325,7 @@ model FileBatch {
   createdAt     DateTime    @default(now())
   referrals     Referral[]
   errors        ValidationError[]
+  events        ReferralStatusEvent[]
 }
 
 model ValidationError {
@@ -359,6 +377,7 @@ model ReferralStatusEvent {
   fromOwner  NextActionOwner?
   toOwner    NextActionOwner?
   batchId    String
+  batch      FileBatch       @relation(fields: [batchId], references: [id])
   createdAt  DateTime        @default(now())
   @@index([referralId, createdAt])
   @@index([batchId, type])
@@ -367,6 +386,7 @@ model ReferralStatusEvent {
 model AdoptionEvent {
   id        String   @id @default(uuid())
   userId    String
+  user      User     @relation(fields: [userId], references: [id])
   kind      String   // "LOGIN" | "PATIENTS_FETCH" — PHI-free
   accountId String?
   createdAt DateTime @default(now())
@@ -385,8 +405,8 @@ model AuditLog {
 }
 ```
 
-### 5.1 Date discipline
-`patientDob` and any date-only field: parse to `YYYY-MM-DD` strings, store via `@db.Date`, render verbatim. Excel serial dates use epoch 1899-12-30, computed timezone-naive. A DOB stored on the East Coast must render identically on the West Coast — an off-by-one DOB is a patient-identification hazard, not a cosmetic bug.
+### 5.1 Date discipline (boundary convention)
+Date-only values cross three boundaries — fix the representation at each: (1) **Parser/DTOs:** date-only values are `YYYY-MM-DD` STRINGS (Excel serials converted with epoch 1899-12-30, timezone-naive). (2) **DB write:** convert the string to `new Date(s + "T00:00:00.000Z")` (controlled UTC midnight) for Prisma `@db.Date` — Prisma truncates to the date. (3) **API response:** serialize `patientDob` back to `YYYY-MM-DD` via `toISOString().slice(0,10)` before sending; clients format the string directly (`MM/DD/****` mask in lists) and NEVER pass it through `new Date()`/`toLocaleDateString()`. A DOB stored on the East Coast must render identically on the West Coast — an off-by-one DOB is a patient-identification hazard.
 
 ---
 
@@ -413,7 +433,8 @@ Base `/api/v1`. Auth handled by SuperTokens at `/auth/*` — no custom auth rout
 ### Provider-facing (extension + web view)
 - `GET /patients` (header `X-Account-Id` required) → `{ account, lastPublishedAt, summary: { totalActive, newToday, needsAction, paPending }, patients: [...] }`. Summary computed server-side from §1.4 predicates; rows capped at 500, sorted needs-action-pinned then `statusUpdatedAt` desc; query params `?status=&phase=&search=` (search = case-insensitive patient-name contains). Logs an `AdoptionEvent(PATIENTS_FETCH)`.
 - `GET /patients/:id` → detail incl. status explanation key, `events` (status history), guaranteed fields always, conditional fields (history) only when present. Cross-account or unknown id → **404** (never 403; no existence leak).
-- `GET /healthz` (public) → `{ db: ok, supertokens: ok }`.
+- `GET /healthz` (public) → `{ db: "ok", supertokens: "ok", minExtensionVersion: "1.0.0" }` (single endpoint serves both readiness and client version policy).
+- `GET /me` (protected: `verifySession` + `resolveLocalUser`) → `{ email, role, accountIds }` — used by clients post-login and as the Step 3 auth probe.
 
 ### Internal-facing (`requireRole([INTERNAL_ADMIN, INTERNAL_STAFF])`)
 - `POST /upload` — multipart (multer, 10MB limit, extension+MIME check `.csv/.xlsx`). Parses (§10), validates, persists FileBatch + ValidationErrors. Returns counts, header-resolution report, errors (first 200 + totals), account preview, `canPublish`.
@@ -451,12 +472,12 @@ Aliases are NEVER auto-created. Resolving an unmatched name is an explicit admin
 ## Section 9: Publish Semantics
 
 Inside one Prisma transaction with the `FileBatch` row locked:
-1. Idempotency guard: batch must be `VALIDATED`; anything else → **409** ("Batch already published" / "Batch failed validation"). Transition `VALIDATED → PUBLISHING`.
+1. Idempotency guard + lock in one statement (Prisma has no row-lock API on `findUnique`): `updateMany({ where: { id: batchId, status: "VALIDATED" }, data: { status: "PUBLISHING" } })` — affected count 0 → **409** ("Batch already published" / "Batch failed validation" / "Publish already in progress"). This conditional update IS the lock; concurrent publishers lose the race deterministically.
 2. Upsert referrals by `(referralId, accountId)` in chunks of 200 (explicit transaction timeout 60s; validation caps files at 10,000 rows).
 3. Write `ReferralStatusEvent` rows: `CREATED` for new; `STATUS_CHANGED`/`PHASE_CHANGED`/`OWNER_CHANGED` by diffing the locked prior row.
 4. **Account-move guard:** if a `referralId` arrives under account B while an active row exists under account A, deactivate A's row (`DEACTIVATED` event) — a corrected assignment must not leave PHI visible to the wrong practice. Surfaced in the diff preview.
 5. **Bulk deactivation is DISABLED by default.** `PUBLISH_DEACTIVATE_MISSING=false` until ops answers cumulative-vs-incremental in writing (owner: Insight operations admin). When enabled, deactivation is scoped to accounts present in the file. The preview's deactivation count requires an explicit confirmation checkbox when > 0. Referrals are never deleted.
-6. Transition `PUBLISHING → PUBLISHED` + `publishedAt`; on any error the transaction rolls back, batch → `FAILED` + `failureReason`, UI shows "Publish failed — no changes were applied."
+6. Transition `PUBLISHING → PUBLISHED` + `publishedAt` inside the transaction. **Failure handling is two-phase:** if the transaction throws, it rolls back ALL of steps 2–6; the catch block — OUTSIDE the transaction — then writes `FileBatch.status = FAILED` + `failureReason` as a separate update. UI shows "Publish failed — no changes were applied."
 7. Post-commit: audit log, ops-alert check (§16), digest enqueue (§14).
 
 ---
@@ -464,7 +485,7 @@ Inside one Prisma transaction with the `FileBatch` row locked:
 ## Section 10: File Contract (the ops admin's API — full reference in docs/file-contract.md)
 
 ### 10.1 Formats
-CSV (UTF-8, BOM tolerated via `bom: true`; Windows-1252 detected and converted, else a clear encoding error) or XLSX (**first non-empty sheet only**; >1 non-empty sheet → validation error naming the sheets). 10MB upload cap, 10,000 row cap, zip-ratio guard for XLSX. Blank rows skipped. Duplicate headers → error. Formula cells: display values. Reported row numbers match what the admin sees in Excel (header = row 1).
+CSV: UTF-8 with BOM tolerated (`bom: true`); non-UTF-8 input is detected by strict UTF-8 decode failure and converted from Windows-1252 via `iconv-lite` (pinned, §2); anything else → clear encoding error. XLSX: the workbook must contain **exactly one non-empty sheet** — zero or more than one non-empty sheet is a validation error naming the sheets. 10MB upload cap, 10,000 row cap; XLSX zip-bomb guard: before workbook load, inspect ZIP entries with `yauzl` (pinned, §2) and reject if total uncompressed size > 50MB or any entry's compression ratio > 100×. Blank rows skipped. Duplicate headers → error. Formula cells: display values. Reported row numbers match what the admin sees in Excel (header = row 1).
 
 ### 10.2 Columns (case-insensitive, trimmed; canonical header → aliases)
 
@@ -516,7 +537,7 @@ Example row: `Row 14 · patient_dob · "13/44/2025" · Problem: invalid date · 
 }
 ```
 
-Generate the dev keypair once (`docs/release-runbook.md` has the openssl commands), commit the public `key`, derive the stable extension ID, print it in the README, and bake the matching `EXTENSION_ORIGIN` into `.env.example` — **zero placeholders at clone time**. @crxjs/vite-plugin owns entry wiring. The popup footer shows the extension version; `GET /healthz` returns `minExtensionVersion` and the popup shows "Update required" when older. Badge: set from the popup on open (needs-action count via message to the SW; `chrome.action.setBadgeText`); a live SW-side fetch is V2 (TODOS — supertokens-web-js cannot run in an MV3 service worker).
+Build Step 1 includes `pnpm gen:extension-key`: generates the keypair once (openssl commands in `docs/release-runbook.md`), writes the public `key` into manifest.json, derives the stable extension ID, prints it in the README, and rewrites `EXTENSION_ORIGIN`/`ALLOWED_ORIGINS` in `.env.example` with the real value. Key + updated files are **committed in Step 1**, so every subsequent clone has zero placeholders. (`<derived-from-committed-key>` in §20 denotes the value this step bakes in — it exists only until Step 1's first run.) @crxjs/vite-plugin owns entry wiring. The popup footer shows the extension version; `GET /healthz` returns `minExtensionVersion` and the popup shows "Update required" when older. Badge: set from the popup on open (needs-action count via message to the SW; `chrome.action.setBadgeText`); a live SW-side fetch is V2 (TODOS — supertokens-web-js cannot run in an MV3 service worker).
 
 Popup: 420×600. Web view target: same app, full viewport, served at `WEB_VIEW_ORIGIN`.
 
@@ -596,7 +617,7 @@ Structured console lines (`[upload] batch=... rows=... errors=... ms=...`) at up
 
 ## Section 17: Deployment
 
-**Dev:** `docker-compose.yml` runs `postgres:15` (app DB + `supertokens` DB) and `registry.supertokens.io/supertokens/supertokens-postgresql` (port 3567). Quick start: `docker compose up -d && cp .env.example .env && pnpm install && pnpm db:setup && pnpm dev` (db:setup = migrate + seed:foundation + seed:users + seed:referrals). `pnpm build:extension` → load unpacked → ID already matches `.env.example`.
+**Dev:** `docker-compose.yml` runs `postgres:15` (app DB + `supertokens` DB), `registry.supertokens.io/supertokens/supertokens-postgresql` (port 3567), and `axllent/mailpit` (SMTP :1025, web UI :8025 — digest/alert emails land here; Step 10 verifies against the Mailpit UI/API). Quick start: `docker compose up -d && cp .env.example .env && pnpm install && pnpm db:setup && pnpm dev` (db:setup = migrate + seed:foundation + seed:users + seed:referrals). `pnpm build:extension` → load unpacked → ID already matches `.env.example`.
 
 **Prod env matrix (docs/release-runbook.md):** `DATABASE_URL`, `SUPERTOKENS_CONNECTION_URI` (+`SUPERTOKENS_API_KEY`), `API_DOMAIN`, `WEB_VIEW_ORIGIN`, `INTERNAL_TOOL_ORIGIN`, `EXTENSION_ORIGIN`, `ALLOWED_ORIGINS`, `SMTP_*`, `OPS_ALERT_EMAIL`, `OPS_ALERT_DEADLINE`, `PUBLISH_DEACTIVATE_MISSING`, `BOOTSTRAP_ADMIN_*`. Cookies: `secure`, `sameSite=lax` (internal tool + web view are first-party to the API domain or use subdomains).
 
@@ -614,7 +635,7 @@ Framework: vitest + supertest (backend; ST core via docker), Playwright for 3 E2
 3. **Publish transaction:** mid-batch failure rolls back to zero changes (batch FAILED); concurrent publish → one 409; re-publish published batch → 409; account-move deactivates the old row + emits DEACTIVATED; deactivation default-off honored.
 4. **Parser fixtures:** every file in `/fixtures` produces its exact expected outcome (incl. BOM, win-1252, serial dates with no TZ shift, multi-sheet error, dup headers, dup referral_id with both row numbers, unknown status with mapping hint).
 
-**Unit:** normalizeName (suffixes, punctuation→space, hyphens), accountMatcher (NPI>name>alias priority, collision rejection, did-you-mean), validation (18-status mapping, enum canonicalization, dates, caps), predicates (needsAction, newToday incl. republish behavior), digest assembly (PHI-minimization, one-per-day).
+**Unit:** normalizeName (suffixes, punctuation→space, hyphens; explicit cases: "GI, LLC", "GI LLC MD", "Smith-Jones Rheumatology"), accountMatcher (NPI>name>alias priority, collision rejection, did-you-mean), validation (18-status mapping, enum canonicalization, dates, caps), predicates (needsAction, newToday incl. republish behavior), digest assembly (PHI-minimization, one-per-day).
 **Integration:** upload→validate→preview→publish→GET /patients end-to-end; overview counts; user provisioning compensation; alias creation flow.
 **E2E (Playwright):** provider daily flow (login → needs-action → detail → sign-out); admin publish ritual (upload fixture → diff → publish → extension shows data); multi-account picker switch.
 **Flakiness rules:** dockerized ST core only; clock injection for staleness tests; no ordering-dependent assertions.
@@ -623,11 +644,11 @@ Framework: vitest + supertest (backend; ST core via docker), Playwright for 3 E2
 
 ## Section 19: Build Order
 
-**Step 1 — Monorepo + infra.** Workspace, all package.jsons with pinned deps (§2), docker-compose.yml, `.env.example` (working values incl. derived extension origin; `SUPERTOKENS_CONNECTION_URI=http://localhost:3567`), shared package with §1.3 table, root scripts. *Verify:* `docker compose up -d` healthy; `pnpm install` clean.
+**Step 1 — Monorepo + infra.** Workspace, all package.jsons with pinned deps (§2), docker-compose.yml (postgres + supertokens + mailpit), shared package with §1.3 table, root scripts incl. `gen:extension-key`. Run `pnpm gen:extension-key` once: commits the manifest `key` and bakes the derived extension origin into `.env.example` (§11). *Verify:* `docker compose up -d` — all three services healthy (Mailpit UI reachable at :8025); `pnpm install` clean; `.env.example` contains no placeholders.
 **Step 2 — Schema + foundation seed.** §5 schema verbatim; `prisma migrate dev`; `seed:foundation` (2 accounts: "GI Medical Services" NPI 1234567890 w/ aliases "GI Med Svc", "GI Medical Svc LLC"; "Metro Rheumatology Associates" NPI 0987654321; provisional status mappings). *Verify:* migrate clean; tables populated; unit tests for normalizeName pass.
-**Step 3 — Backend core + auth.** config, prisma.ts, supertokens.ts (4.1), middlewares (4.2/4.3), healthz, rate limits, wiring (4.5); `seed:users` (admin@insightpharmacy.com / sarah@gimedical.com / mike@metrorheum.com — LOCAL-ONLY) then `seed:referrals` (synthetic batch, 17 referrals + CREATED events). *Verify:* signin 200 via authenticated probe route; fail-closed + isActive integration tests pass.
-**Step 4 — Ingestion.** fileParser (§10.1/10.3), validation (§10.2/10.4 + error copy), statusMapping, accountMatcher (§8), upload + preview + errors.csv routes. *Verify:* every fixture produces expected results; `pnpm test` green.
-**Step 5 — Publish.** §9 in full + diff preview endpoint. *Verify:* publish suite (ship-blocking #3) green; fixture publish visible via psql.
+**Step 3 — Backend core + auth.** config, prisma.ts, supertokens.ts (4.1), middlewares (4.2/4.3), healthz, rate limits, wiring (4.5); `seed:users` (admin@insightpharmacy.com / sarah@gimedical.com / mike@metrorheum.com — LOCAL-ONLY) then `seed:referrals` (synthetic batch, 17 referrals + CREATED events). *Verify:* signin 200 then `GET /me` returns role + accountIds; fail-closed + isActive integration tests pass.
+**Step 4 — Ingestion.** fileParser (§10.1/10.3), validation (§10.2/10.4 + error copy), statusMapping, accountMatcher (§8), upload route + parse/validate/error preview + errors.csv. (Publish-aware diff fields — new/changed/deactivated — are NOT in this step.) *Verify:* every fixture produces expected results; `pnpm test` green.
+**Step 5 — Publish.** §9 in full + the publish-aware diff preview endpoint (`GET /upload/:batchId/preview` gains new/statusChanged/deactivated/account-move fields, which depend on §9 diffing). *Verify:* publish suite (ship-blocking #3) green; fixture publish visible via psql.
 **Step 6 — Provider API.** patients routes + predicates + summary + adoption events. *Verify:* cross-tenant suite (ship-blocking #1) green.
 **Step 7 — Accounts/Users/Overview/Batches APIs.** §6 + §7 internal routes. *Verify:* provisioning compensation test green; overview counts correct.
 **Step 8 — Extension.** §11 manifest + crxjs config; §12 components/states; built also as web target. *Verify:* load unpacked with pre-derived ID; login as sarah; only GI Medical patients; filters/search/detail/picker/sign-out work; states render (network-off shows Retry).
