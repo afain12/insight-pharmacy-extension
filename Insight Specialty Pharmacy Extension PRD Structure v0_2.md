@@ -706,6 +706,8 @@ router.post("/users", verifySession(), requireRole(\["INTERNAL_ADMIN"\]), async 
 
 Backend validates against these exact values. Any value not in the list is a validation error.
 
+> **AMENDED by /autoplan review (2026-06-11, premise gate D2):** canonical taxonomy is the 15 values below **plus 3**: `Physician enrollment pending`, `Telehealth no-show`, `Address confirmation pending` (18 total). Additionally, a backend **status-mapping layer** is required: the uploaded file must carry `internal_status` (required); the backend maps internal→canonical provider status via a mapping table; a `provider_status` column in the file is an optional override. Unknown internal statuses are validation errors. See GSTACK REVIEW REPORT amendment 2.
+
 Provider status values:
 
 * Referral received
@@ -764,7 +766,7 @@ POST `/upload` — Multipart form. Accepts CSV/XLSX. Parses, validates, creates 
 
 GET `/upload/:batchId/preview` — Parsed records grouped by account.
 
-POST `/upload/:batchId/publish` — Upserts referrals by referralId + accountId. Marks referrals missing from new file as isActive=false. Logs audit entry.
+POST `/upload/:batchId/publish` — Upserts referrals by referralId + accountId, wrapped in a single transaction with an idempotency guard (re-publishing a published batch returns 409). **AMENDED (review amendment 1):** deactivation of missing referrals is scoped to accounts present in the file, and is DISABLED by default until ops answers cumulative-vs-incremental in writing (owner: Insight operations admin; fallback if unanswered: no auto-deactivation, manual deactivation via admin UI only). Writes ReferralStatusEvent rows for changed statuses. Logs audit entry.
 
 GET/POST/PUT `/accounts` — CRUD. POST `/accounts/:id/aliases` to add aliases.
 
@@ -813,7 +815,8 @@ Parser maps these headers (case-insensitive, trimmed):
 | patient_last_name, Last Name | patientLastName | Yes |
 | patient_dob, DOB, Date of Birth | patientDob | Yes |
 | medication_name, Medication, Drug Name | medicationName | No |
-| provider_status, Status | providerStatus | Yes |
+| internal_status, Internal Status | internalStatus | Yes (AMENDED — backend maps internal→canonical; see Section 7) |
+| provider_status, Status | providerStatus | No (AMENDED — optional override of the mapped status) |
 | workflow_phase, Phase | workflowPhase | Yes |
 | next_action_owner, Next Action, Action Owner | nextActionOwner | Yes |
 | status_note, Notes | statusNote | No |
@@ -1095,7 +1098,7 @@ PORT=3001
 
 
 
-* [ ] Referrals not in new file are marked inactive, not deleted.
+* [ ] Referrals not in new file are deactivated ONLY per amended publish semantics (scoped to accounts in file; disabled until file-cadence semantics confirmed by ops; never deleted).
 
 
 
@@ -1120,6 +1123,224 @@ PORT=3001
 
 
 * [ ] Public sign-up is disabled. Only admin-created users can log in.
+
+---
+
+<!-- AUTONOMOUS DECISION LOG -->
+# GSTACK REVIEW REPORT (/autoplan 2026-06-11)
+
+Reviewed as one plan: this build spec + product PRD ("...v0_2 (1).md") + SOP-SPI-001 v2.0 (3 PDFs).
+Premise gate (user-decided): D1 premises confirmed as-is (HIPAA baseline NOT added to scope — risk register only). D2 canonical taxonomy = spec 15 + {Telehealth no-show, Address confirmation pending, Physician enrollment pending} = 18. D3 User↔Account = many-to-many join table. D4 admin overview page WITH health labels in V1.
+
+## Phase 1 — CEO Review
+
+### Plan Amendments (auto-adopted)
+1. Publish semantics: wrap in transaction; deactivation scoped to accounts present in file; NO auto-deactivation until cumulative-vs-incremental answered in writing by ops; idempotency guard (published batch cannot re-publish).
+2. Status mapping layer in backend: file requires internal_status; backend maps internal→18 canonical provider statuses via mapping table; provider_status column optional override; unknown internal status = validation error.
+3. New table ReferralStatusEvent (referralId, fromStatus, toStatus, phase, owner, batchId, createdAt) written on publish when status/phase/owner changes.
+4. User↔Account many-to-many: UserAccount join table; session claims carry accountIds[]; extension account picker when >1.
+5. Admin overview page: per-account cards (active, new today, needs action, last publish, last provider login) + health labels (growing/stalled/friction/at-risk) per D4 — label definitions from V1-collectable data only (referral volume trend across batches, needs-action aging, login recency).
+6. Shared PrismaClient module; fix session-override sample (no per-login client, no require() in function).
+7. AuditLog userId bug: resolve User by supertokensId before writing audit rows.
+8. isActive enforced at request time in accountScope/requireRole middleware (deactivated users lose access immediately).
+9. Upload hardening: multer 10MB limit, extension+MIME check, empty-file and zero-valid-row errors, duplicate referral_id within file = validation error, row-level date parsing (ISO, M/D/YYYY, Excel serial) with per-row errors.
+10. Fuzzy "did you mean" account suggestions on unmatched names (normalized Levenshtein) in validation report.
+11. Publish diff preview: counts of new / status-changed / deactivated per account before confirm.
+12. lastLoginAt on User (updated on signin) + PHI-free adoption events (login, patients-fetch) server-side.
+13. Browser action badge with needs-action count (taste decision T1 — droppable at gate).
+14. Deployment section added: hosting target w/ HTTPS + managed Postgres; production SuperTokens core (decision: self-host vs managed); extension packaged as zip for pilot side-load (Web Store = open decision); migrate-then-deploy order; post-deploy smoke checks.
+15. Test plan added (global TDD law overrides spec's no-tests contract) — full diagram in Phase 3 below.
+16. Versioned file-schema contract doc for ops; README + ops runbook.
+17. Phase-0 hard gate: obtain >=3 real sample exports and answer ID-stability + cumulative/incremental BEFORE schema freeze (both outside voices flagged critical).
+18. Index added: (accountId, isActive). Pagination deferred (threshold ~300 active referrals/account → TODOS).
+
+### NOT in scope (deferred with rationale)
+- HIPAA/compliance baseline (user decision D1; both models flag CRITICAL → User Challenge at gate; risk register below)
+- Email digest + web-app-first channel (User Challenge UC2 at gate; PRD could-have)
+- Google Sheets API direct ingestion (new infra; TODOS)
+- SLA-risk indicators (file lacks documentation_complete_at; SOP measures from complete documentation; showing referral-age would be wrong)
+- Pagination, batch unpublish/rollback UI, publish-missed alerting, PHI read-access audit, MFA (TODOS/risk register)
+- Clipboard patient-summary copy (REJECTED: PHI to clipboard on shared workstations)
+- Triage tag display (PRD open question; not in 18-status set; ops capture unverified)
+
+### What already exists (leverage map)
+- Auth flows/UI: SuperTokens (EmailPassword + Session, prebuilt React UI for internal tool, web-js header mode for extension) — all auth routes owned by ST, zero custom auth code. CORRECT reuse.
+- Parsing: csv-parse + xlsx; Validation: zod; ORM/migrations: Prisma — standard, no wheels reinvented.
+- SOP-SPI-001 already defines the 4-phase model + KPIs; marketing SOP variant = provider-facing vocabulary source.
+
+### Dream state delta
+This plan (as amended) reaches: file→validate→preview→publish→account-scoped extension + admin command view. 12-month ideal additionally needs: automated ingestion (Sheets API), SLA engine anchored on documentation_complete_at, push channel (digest), Web Store distribution, 10-30 accounts. Schema after amendments (join table, status events, mapping layer) supports that trajectory without rework.
+
+### Error & Rescue Registry
+| CODEPATH | WHAT CAN GO WRONG | HANDLING (as amended) | USER SEES |
+|---|---|---|---|
+| POST /upload parse | malformed CSV / corrupt XLSX | 400 w/ parse error detail | "File could not be read" + detail |
+| POST /upload parse | missing required columns | 400 listing missing columns | exact column list |
+| POST /upload parse | empty file / zero valid rows | 400 validation error | "No data rows found" |
+| POST /upload parse | >10MB / wrong MIME | 413 / 415 | size/type message |
+| row validation | bad date (text, serial, garbage) | per-row ValidationError(severity=CRITICAL) | row+field+message table |
+| row validation | unknown internal_status | per-row CRITICAL | row+value+allowed list |
+| row validation | duplicate referral_id in file | per-row CRITICAL | both row numbers |
+| account match | unmatched account_name | CRITICAL + "did you mean" suggestions | suggestion chips |
+| POST /publish | re-publish published batch | 409 idempotency guard | "Batch already published" |
+| POST /publish | DB failure mid-upsert | $transaction rollback, batch stays VALIDATED | "Publish failed, no changes applied" |
+| GET /patients | no/expired session | 401 (ST refresh first) | extension login screen |
+| GET /patients | deactivated user | 403 via isActive check | "Account disabled — contact Insight" |
+| GET /patients/:id | other account's referral | 403 ownership check | "Not found" (no existence leak: return 404) |
+| extension fetch | network failure | error state w/ retry | "Can't reach Insight — Retry" |
+| user creation | duplicate email | 409 from ST signup | inline form error |
+
+### Failure Modes Registry
+| CODEPATH | FAILURE MODE | RESCUED? | TEST? | USER SEES? | LOGGED? |
+|---|---|---|---|---|---|
+| publish | unscoped deactivation wipes other accounts | Y (amendment 1) | Y (integration) | diff preview | audit row |
+| publish | partial upsert on crash | Y (transaction) | Y | error banner | console+batch status |
+| session | stale claims after deactivation | Y (amendment 8) | Y | 403 message | audit row |
+| matching | name fuzzy-routes to wrong account | PARTIAL — preview + alias confirm | Y | admin preview | audit row |
+| upload | Excel serial dates ingested as numbers | Y (amendment 9) | Y | row errors | ValidationError rows |
+| extension | popup opened during publish | Y (refetch on open) | E2E | fresh data | n/a |
+| ops | daily upload skipped (vacation/turnover) | N — RISK | n/a | stale amber banner >24h | TODOS: publish-missed alert |
+
+### Risk Register (accepted risks per premise gate D1)
+- PHI (name, DOB, medication) stored/displayed without documented HIPAA baseline: no BAA chain named, no encryption-at-rest requirement, no session-timeout policy, no PHI read-access audit, no DOB masking decision, no breach-response owner. BOTH outside voices rate CRITICAL. SOP mandates monthly HIPAA audits — this system will be audited against controls it hasn't documented. Mitigation available cheap (~0.5 day CC). USER CHALLENGE UC1 at final gate.
+- Extension installability on managed provider-office Chrome: unvalidated. Mitigation: keep popup URL-addressable (UC2); validate with pilot offices week 1.
+- Single-human daily upload process: stale-data risk by design. Mitigations: staleness banner (spec'd), publish-missed alert (TODO), Sheets API (TODO).
+
+## Decision Audit Trail
+| # | Phase | Decision | Class | Principle | Rationale | Rejected |
+|---|---|---|---|---|---|---|
+| 1 | 0 | Skip /office-hours offer | Mechanical | P3/P6 | PRD already contains problem statement/premise/risks | run it |
+| 2 | 0 | DX scope = yes | Mechanical | P1 | keyword threshold + AI-agent-executes-spec trigger | skip DX |
+| 3 | 1 | Approach B: spec + alignment fixes | Mechanical | P1 | fixes 5 cross-doc contradictions pre-build; A=6/10, B=9/10, C=3/10 | A, C |
+| 4 | 1 | Reject clipboard-copy expansion | Mechanical | P1(trust) | PHI to clipboard on shared workstations | add |
+| 5 | 1 | Add needs-action badge | TASTE | P2 | ambient visibility; con: counts visible on shared screens | skip |
+| 6 | 1 | Add publish diff preview | Mechanical | P2 | makes dangerous publish step legible | skip |
+| 7 | 1 | Add did-you-mean suggestions | Mechanical | P2 | top-named fragility (matching) | skip |
+| 8 | 1 | Add lastLoginAt + adoption events | Mechanical | P2 | required by D4 cards + PRD tracking plan | skip |
+| 9 | 1 | Defer Sheets API to TODOS | Mechanical | P2 | new infra, outside V1 radius | build now |
+| 10 | 1 | Defer SLA indicators | Mechanical | P1 | SOP measures from complete-documentation; data absent | build |
+| 11 | 1 | Publish semantics amendment | Mechanical | P1 | both voices CRITICAL: silent deactivation hazard | as-spec |
+| 12 | 1 | Backend status-mapping layer | Mechanical | P1/P4 | PRD requires internal_status; spec dropped it | file-side mapping only |
+| 13 | 1 | ReferralStatusEvent table | Mechanical | P1 | newToday/what-changed/history/recovery | current-state only |
+| 14 | 1 | Prisma client + audit-FK + isActive fixes | Mechanical | P1/P5 | concrete bugs in spec samples | as-spec |
+| 15 | 1 | Upload hardening bundle | Mechanical | P1 | real hospital files are messy | trust input |
+| 16 | 1 | Deployment section | Mechanical | P1 | spec ends at localhost; production-readiness requires it | defer |
+| 17 | 1 | Test plan despite no-tests contract | Mechanical | global TDD law | user's global CLAUDE.md overrides doc silence | honor contract |
+| 18 | 1 | Phase-0 sample-export hard gate | Mechanical | P1 | both voices CRITICAL: schema frozen against unseen file | proceed |
+| 19 | 1 | Defer pagination w/ threshold | Mechanical | P3 | pilot scale ≤3 accounts | build now |
+| 20 | 2 | Hierarchy restructure: 1-line header, needs-action banner first, list above fold | Mechanical | P5 | both voices CRITICAL: chrome ate 45% of popup | spec order |
+| 21 | 2 | Summary counts are filters (synced w/ chips) | Mechanical | P1 | PRD requires clickable counts | display-only |
+| 22 | 2 | Two-tier sort (pinned needs-action group, then recency) | Mechanical | P5 | spec self-contradicts on sort | pick one silently |
+| 23 | 2 | Add SearchBar.tsx (debounce, clear, empty state) | Mechanical | P1 | in API+checklist, missing from components | ship w/o search |
+| 24 | 2 | Per-surface state matrix (loading/error/401/403/stale/empty) | Mechanical | P1 | both voices: states unspecified | implementer invents |
+| 25 | 2 | Upload page = 4-step stepper w/ locked publish + account-first diff + deactivation confirm | Mechanical | P1 | PRD demands progress/error states; publish is the dangerous step | 3-sentence spec |
+| 26 | 2 | AccountPicker as fixed top context bar, persisted selection | Mechanical | P1 | D3 made it necessary; PHI needs unmistakable account context | unspecified picker |
+| 27 | 2 | Canonical 18-row status table (label/short/explanation/color/chip/needs-action/summary bucket) | Mechanical | P4/P5 | 3 drifting partial lists guaranteed inconsistency | keep 3 lists |
+| 28 | 2 | needs-action + new-today predicates (server-computed) | Mechanical | P5 | both voices CRITICAL: most prominent numbers undefined | client-side improvisation |
+| 29 | 2 | Sign-out + signed-in-as footer; 12h idle TTL default; admin temp-password reset | Mechanical | P1 | shared workstations; PRD requires reset; spec had neither | indefinite sessions |
+| 30 | 2 | Replace 3-screen onboarding with 1 dismissable first-run card | Mechanical | P5 | both voices converged; sub-60s persona | 3 screens |
+| 31 | 2 | Stale-copy rules (no icon <48h, blame-correct wording) | Mechanical | P1 | stale warning stranded the user | bare amber warning |
+| 32 | 2 | Badge promoted to standard scope (habit trigger) | Mechanical | P1 | only re-engagement mechanism; was taste T1 | droppable |
+| 33 | 2 | PatientDetail interaction spec + guaranteed-vs-conditional fields | Mechanical | P5 | "slide-in panel" underspecified; SLA/history data may not exist | fake precision |
+| 34 | 2 | A11y acceptance criteria (keyboard/focus/44px/AA) | Mechanical | P1 | aspirational → executable | aspirational |
+| 35 | 2 | Internal tool depth: Overview.tsx + health-label formulas + insufficient-data fallback | Mechanical | P5 | D4 included labels; formulas prevent invented heuristics | implementer invents math |
+| 36 | 2 | Keep Inter font (conscious deviation from no-default-font rule) | TASTE | P3 | operational legibility > brand expressiveness here | expressive typeface |
+
+## Phase 2 — Design Review Amendments (detail)
+
+### Canonical status table (replaces Section 12 STATUS_EXPLANATIONS, chip list, and summary buckets as 3 separate lists)
+| Canonical status | Chip bucket | Color | Needs-action | Summary bucket |
+|---|---|---|---|---|
+| Physician enrollment pending | All | neutral #6B7280 | when owner=Provider office | Total |
+| Referral received | New Today* | neutral | no | Total/New |
+| eRx received | New Today* | neutral | no | Total/New |
+| Missing information | Needs Action | amber #F59E0B | YES | Needs attention |
+| Intake in progress | All | neutral | no | Total |
+| Prior authorization initiated | PA Pending | indigo #4F46E5 | no | PA pending |
+| Prior authorization pending | PA Pending | indigo | no | PA pending |
+| Prior authorization approved | PA Approved | emerald #10B981 | no | Total |
+| Prior authorization denied | PA Pending | neutral (NOT red — Insight is handling) | no | Total |
+| Telehealth pending | Telehealth | neutral | no | Total |
+| Telehealth scheduled | Telehealth | neutral | no | Total |
+| Telehealth no-show | Telehealth | amber | when owner=Patient+office can help | Needs attention if flagged |
+| Telehealth completed | Telehealth | emerald | no | Total |
+| Address confirmation pending | Needs Action | amber | when owner=Provider office/Patient | Needs attention |
+| Fulfillment in progress | Shipping | blue #3B82F6 | no | Total |
+| Medication shipped | Shipping | blue | no | Total |
+| Delivered | Shipping | emerald | no | Total |
+| Closed | All | neutral | no | excluded from Total active |
+*New Today is a computed predicate, not a status bucket — chip counts referrals where newToday=true regardless of status.
+
+New explanation copy: "Physician enrollment pending" → "Provider setup (CDTM agreement) is not yet complete for this prescriber. Insight will reach out if anything is needed from your office." | "Telehealth no-show" → "The patient missed the scheduled telehealth visit. Insight is following up to reschedule." | "Address confirmation pending" → "The patient's delivery address needs to be confirmed before the medication can ship."
+
+### Predicates (server-computed only)
+- needsAction := nextActionOwner == "Provider office"
+- newToday := referral first appeared OR status changed in the most recent published batch (via ReferralStatusEvent)
+
+### State matrix (extension popup)
+| State | Trigger | User sees | Action |
+|---|---|---|---|
+| Loading | initial fetch | skeleton rows (header + 5 row ghosts) | — |
+| Network error | fetch reject | "Can't reach Insight" | Retry button |
+| 401 | session expired+refresh failed | LoginForm | sign in |
+| 403 deactivated | isActive=false | "Account disabled — contact Insight" | — |
+| Empty (no referrals) | 0 active | warm empty copy (spec) | — |
+| Empty (filter) | 0 matches | "No patients match this filter." | clear-filter link |
+| Stale | >24h since publish | subdued "as of" line; amber+icon only ≥48h | — |
+| Multi-account | >1 account | context bar w/ account name; switch = confirm + refetch | picker |
+
+### Internal tool: Upload = 4-step stepper (Upload → Validate → Preview diff → Publish); publish button locked while in-flight; failure banner "Publish failed — no changes applied"; diff preview is account-first (new/changed/deactivated counts per account + unmatched rows w/ did-you-mean) and requires an explicit confirmation checkbox when deactivations > 0. Overview.tsx added (route /, account health cards). Health labels: friction = any needs-action item >3 business days old; at-risk = no provider login in 14d; stalled = zero new referrals in 14d; growing = new referrals up batch-over-batch 2 consecutive weeks; else "insufficient data" (first 2 weeks always show insufficient data).
+
+### A11y acceptance criteria: filters/chips keyboard-reachable; drawer focus-trap + Esc + focus restore; 44px min targets; WCAG AA contrast; visible focus ring; aria-labels on counts/chips ("5 patients, prior authorization pending").
+
+## Phase 3 — Engineering Review Amendments
+
+| # | Phase | Decision | Class | Principle | Rationale | Rejected |
+|---|---|---|---|---|---|---|
+| 37 | 3 | FAIL-CLOSED session claims: accountScope denies unless role ∈ enum; patients service asserts non-empty accountId; createNewSession override rejects when user row missing | Mechanical | P1 SECURITY | undefined claims pass accountScope and Prisma drops undefined where-filter → cross-tenant PHI dump (Claude conf 8, Codex agrees) | as-spec (fail-open) |
+| 38 | 3 | Section 5 schema is REWRITTEN as canonical: UserAccount M:N, ReferralStatusEvent (typed CREATED/STATUS_CHANGED/PHASE_CHANGED/OWNER_CHANGED), StatusMapping, AdoptionEvent, lastLoginAt, Prisma enums (role/status/phase/owner/severity/batchStatus), patientDob @db.Date, AccountAlias.normalized @unique, index (accountId,isActive,statusUpdatedAt) | Mechanical | P1/P5 | amendments must live in the concrete Prisma block, not report prose; stringly-typed enums invite bad data | prose-only amendments |
+| 39 | 3 | Multi-account API contract: claims.accountIds[]; GET /patients requires X-Account-Id validated ∈ claims; claims re-minted on refresh | Mechanical | P1 | D3 was unpropagated — two contradictory designs in one doc | scalar accountId |
+| 40 | 3 | Seed split: foundation (accounts/aliases/mappings) → users (post-ST) → referrals (synthetic batch) | Mechanical | P5 | Step 2 as written cannot execute (batchId→uploadedById→User chicken-egg) | spec order |
+| 41 | 3 | manifest.json "key" field pinned (deterministic extension ID) + @crxjs/vite-plugin for MV3 build | Mechanical | P1 | unpacked IDs derive from path → CORS allowlist breaks per-machine; Vite default emit doesn't match manifest paths | hand-rolled build |
+| 42 | 3 | Badge = popup-open update only in V1 (no SW fetch); SW token bridge → TODOS | Mechanical | P3/P5 | supertokens-web-js has no localStorage/fetch-intercept in MV3 SW — live badge is a hidden mini-project | spec a token bridge now |
+| 43 | 3 | DOB + date-only fields as @db.Date, serial epoch 1899-12-30, no TZ round-trips | Mechanical | P1 | DOB off-by-one = patient misidentification hazard | DateTime + toLocaleDateString |
+| 44 | 3 | Replace npm xlsx with exceljs (or CDN-pinned SheetJS); decompressed-size + row-count caps | Mechanical | P1 SECURITY | npm xlsx frozen at 0.18.5 w/ CVE-2023-30533 + CVE-2024-22363; zip-bomb DoS on PHI backend | npm xlsx |
+| 45 | 3 | Rate limiting on /auth/* + /upload; password policy for admin-created users; Karpathy contract narrowed (no-rate-limit clause deleted; no-tests clause replaced by Test Plan requirement) | Mechanical | P1 SECURITY | PHI login with zero brute-force protection; implementers obey the contract, not the appendix | contract as-is |
+| 46 | 3 | Account-move handling: referralId active under different account → old row deactivated + surfaced in diff preview | Mechanical | P1 | with bulk deactivation OFF, a corrected account assignment leaves PHI visible to the wrong practice forever | leave both active |
+| 47 | 3 | Cross-account access returns 404 (no existence leak); Steps 5/9 verification updated | Mechanical | P5 | spec self-contradicted (403 in Steps, 404 in registry) | 403 |
+| 48 | 3 | Parser contract: bom:true, UTF-8→win-1252 fallback, first-non-empty-sheet rule (else validation error), blank-row skip, dup-header dedup, formula display values, Excel-matching row numbers, first-N errors + totals | Mechanical | P1 | Excel-exported CSVs are BOM'd; Windows CSVs are 1252; workbooks have tabs | assume clean UTF-8 |
+| 49 | 3 | Alias hygiene: normalized @unique w/ collision rejection; normalizeName punctuation→space; never auto-create aliases; admin confirm shows NPI context | Mechanical | P1 | nondeterministic match priority + Smith-Jones bug + wrong-account alias = misrouted PHI | as-spec |
+| 50 | 3 | Publish concurrency: FileBatch row-lock, VALIDATED→PUBLISHING→PUBLISHED transitions, chunked writes w/ explicit txn timeout, row-count cap | Mechanical | P1 | two admins can double-publish; interactive $transaction times out ~low-thousands rows | naive loop |
+| 51 | 3 | User-creation compensation: prisma failure after ST signup ⇒ delete ST user / block signin; validate role+account before signup | Mechanical | P1 | orphan ST users can sign in with no profile (feeds finding 37) | ignore |
+| 52 | 3 | Dev auth: local dockerized SuperTokens core (try.supertokens.io is shared + purged); disable public password-reset endpoints (admin temp-password path instead) | Mechanical | P1/P5 | seeded users vanish day 2; live unconfigured reset endpoints = dead attack surface | dev core |
+| 53 | 3 | Ingest canonicalization: trim + case-insensitive for internal_status/workflow_phase/next_action_owner | Mechanical | P1 | "Provider Office " must not zero the needs-action count | exact match |
+| 54 | 3 | Step 3 verification via authenticated probe route (no /auth/session/verify FDI route exists) | Mechanical | P5 | spec names a nonexistent endpoint | as-spec |
+| 55 | 3 | /patients: summary counts separate from rows; rows capped 500; production env matrix (cookie secure/sameSite, prod extension origin, ST core URI, migrate workflow) | Mechanical | P1/P3 | unbounded payloads; deployment must be executable | unbounded |
+| 56 | 3 | Minimal ops alerting IN V1: publish-failure + zero-row + no-publish-by-time (node-cron + email/webhook) | Mechanical | P1 | both voices: "someone must be paged"; stale data kills trust silently | TODO-only |
+| 57 | 3 | FileBatch.batchId on Referral documented as "last published by"; per-batch rows persist only as ValidationError + diff counts | Mechanical | P3 | resolves misleading relation without a second table | split tables now |
+
+Test plan artifact: ~/.gstack/projects/InsightExtension/aaron-master-eng-review-test-plan-20260611.md (ship-blocking suites: cross-tenant isolation, fail-closed auth, publish transaction, parser fixtures).
+
+## Phase 3.5 — DX Review Amendments
+
+| # | Phase | Decision | Class | Principle | Rationale | Rejected |
+|---|---|---|---|---|---|---|
+| 58 | 3.5 | CONSOLIDATION: produce build-spec v0.3 with all amendments merged inline; this appendix demoted to changelog. FIRST implementation task | Mechanical | P5 | both DX voices CRITICAL: "two conflicting specs stapled together"; Section 0 says copy code "exactly" → executor copies known-buggy samples | leave appendix |
+| 59 | 3.5 | Canonical schema.prisma block written into Section 5 (all amended models/enums) as part of v0.3 | Mechanical | P1 | amendment 38 described models in prose; Step 2 unexecutable without the block | prose-only |
+| 60 | 3.5 | docker-compose.yml (postgres:15 + supertokens-postgresql + dedicated st DB) + root scripts (dev/db:setup/seed:*) + /healthz + 6-line Quick Start; TTHW target ≤30 min | Mechanical | P1 | no local infra story = 2-4h of invention | assume services exist |
+| 61 | 3.5 | Committed dev manifest "key" + derived extension ID in README + matching EXTENSION_ORIGIN baked into .env.example (zero placeholders) | Mechanical | P5 | kills the extension-ID/CORS chicken-egg at clone time | YOUR_EXTENSION_ID placeholder |
+| 62 | 3.5 | Build-order Steps 2-3 rewritten with named seed scripts + per-script verification (folds amendment 40 in) | Mechanical | P5 | seed fix lived in prose, not in the steps the executor follows | prose-only |
+| 63 | 3.5 | Provisional StatusMapping fixture seed marked placeholder-pending-Phase-0; Step 4 = mechanism + fixture | Mechanical | P3 | mapping content gated on sample exports; build must not stall | stall Step 4 |
+| 64 | 3.5 | vitest+supertest added; fixtures/ directory (valid CSV+XLSX, missing-column, bad-dates, dup-referral-id, unknown-status, unmatched-account, BOM, win-1252, zip-bomb); tests interleaved into Steps 4-6; pnpm test as verification | Mechanical | P1 | test plan was mandated with no framework, no fixtures, no step | "upload a test CSV" (none provided) |
+| 65 | 3.5 | Version pinning: supertokens-node/web-js/auth-react, prisma, tailwind v4, exceljs, vite exact majors; Node 20 LTS engines; Section 2 package table updated to exceljs | Mechanical | P1 | zero pinning + version-sensitive ST override samples | unpinned |
+| 66 | 3.5 | tsx watch (not ts-node) + scripts blocks for all 3 packages + both vite.config.ts (crxjs+tailwind / standard) included in spec | Mechanical | P5 | ts-node+ESM+Express is a known time-sink; configs were unspecified | ts-node, invent configs |
+| 67 | 3.5 | Error-copy table: literal problem/cause/fix per error code; ValidationError.rawValue column; downloadable error report (CSV) | Mechanical | P1 | ops admin's entire API; detection was specified, remediation wasn't | category-only errors |
+| 68 | 3.5 | Header-resolution preview + ambiguity guard (generic headers resolved + shown); file-contract v1 templates (csv+xlsx) + optional schema_version handshake | Mechanical | P1 | silent header drift is the 3-month failure mode | permissive aliases |
+| 69 | 3.5 | Docs as build Step 10: README.md, docs/file-contract.md, docs/ops-runbook.md, docs/release-runbook.md (extension packaging + side-load update checklist + popup-footer version + minExtensionVersion rule), docs/architecture.md | Mechanical | P1 | spec's own "only listed files" contract guarantees docs never get written otherwise | mandate w/o build step |
+| 70 | 3.5 | API base + apiDomain via VITE_API_DOMAIN (.env.development/.env.production per package) | Mechanical | P5 | hardcoded localhost breaks the packaged-zip prod path | hardcoded |
+| 71 | 3.5 | scripts/smoke.ts: signin → scoped /patients → cross-tenant 404 → bad upload 400 → publish 200→409 | Mechanical | P1 | Step 9 was nine manual checks with no commands | manual-only |
+| 72 | 3.5 | Publish preview in operator language ("3 newly visible to GI Medical...") + PHI-safe batch history (who/file/counts/result/failure reason) | Mechanical | P1 | publish is the trust moment; supportability needs batch history | row counts only |
+| 73 | 3.5 | Seed credentials labeled local-only; production first-admin bootstrap flow (no seeded admin in prod) | Mechanical | P1 | sample passwords leak into staging habits | seed everywhere |
 
 
 
