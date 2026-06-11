@@ -105,6 +105,7 @@ insight-pharmacy-extension/
 ├── .env.example                      # zero placeholders — works as-is for local dev
 ├── .gitignore
 ├── README.md                         # quick start, env table, scripts, extension load procedure, troubleshooting
+├── TODOS.md                          # deferred-scope register (pre-exists in repo; maintained, not produced by a build step)
 ├── docs/
 │   ├── file-contract.md              # versioned ops API: headers, formats, valid values, mapping, templates, error meanings
 │   ├── ops-runbook.md                # daily upload SOP, error triage, publish-failure recovery, user provisioning, alert response
@@ -403,7 +404,7 @@ model AdoptionEvent {
   id        String   @id @default(uuid())
   userId    String
   user      User     @relation(fields: [userId], references: [id])
-  kind      String   // "LOGIN" | "PATIENTS_FETCH" — PHI-free
+  kind      String   // "LOGIN" | "PATIENTS_FETCH" — no patient identifiers
   accountId String?
   createdAt DateTime @default(now())
   @@index([userId, createdAt])
@@ -503,7 +504,7 @@ Inside one Prisma transaction with the `FileBatch` row locked:
 1. Idempotency guard + lock in one statement (Prisma has no row-lock API on `findUnique`): `updateMany({ where: { id: batchId, status: "VALIDATED" }, data: { status: "PUBLISHING" } })` — affected count 0 → **409** ("Batch already published" / "Batch failed validation" / "Publish already in progress"). This conditional update IS the lock; concurrent publishers lose the race deterministically.
 2. Upsert referrals by `(referralId, accountId)` in chunks of 200 (explicit transaction timeout 60s; validation caps files at 10,000 rows).
 3. Write `ReferralStatusEvent` rows: `CREATED` for new; `STATUS_CHANGED`/`PHASE_CHANGED`/`OWNER_CHANGED` by diffing the locked prior row.
-4. **Account-move guard:** if a `referralId` arrives under account B while an active row exists under account A, deactivate A's row (`DEACTIVATED` event) — a corrected assignment must not leave PHI visible to the wrong practice. Surfaced in the diff preview.
+4. **Account-move guard:** if a `referralId` arrives under account B while an active row exists under account A, deactivate A's row (`DEACTIVATED` event) — a corrected assignment must not leave patient data visible to the wrong practice. Surfaced in the diff preview.
 5. **Bulk deactivation is DISABLED by default.** `PUBLISH_DEACTIVATE_MISSING=false` until ops answers cumulative-vs-incremental in writing (owner: Insight operations admin). When enabled, deactivation is scoped to accounts present in the file. The preview's deactivation count requires an explicit confirmation checkbox when > 0. Referrals are never deleted.
 6. Transition `PUBLISHING → PUBLISHED` + `publishedAt` inside the transaction. **Failure handling is two-phase:** if the transaction throws, it rolls back ALL of steps 2–6; the catch block — OUTSIDE the transaction — then writes `FileBatch.status = FAILED` + `failureReason` as a separate update. UI shows "Publish failed — no changes were applied."
 7. Post-commit: audit log, ops-alert check (§16), digest enqueue (§14).
@@ -621,7 +622,7 @@ Tokens from §12.1. SuperTokens prebuilt login at `/auth` (do not restyle in V1)
 
 ## Section 14: Email Digest
 
-On publish: collect provider users with `digestOptIn` whose accounts had changes; for each user, send **one aggregated digest per calendar day** (enforced by `DigestDelivery @@unique([userId, digestDate])`) with a section per affected account. Subject: "Insight updates: 2 need your action". Body (data-minimized): per-account counts by bucket + patient initials + status for needs-action items only + deep link to the web view. Unsubscribe: signed token (HMAC over userId with `DIGEST_TOKEN_SECRET`, no expiry needed) → `GET /digest-unsubscribe?token=` flips `digestOptIn`. Transport: SMTP (nodemailer); failure → `DigestDelivery.status=FAILED`, one retry, logged; never blocks publish.
+On publish: collect provider users with `digestOptIn` whose accounts had changes; for each user, send **one aggregated digest per calendar day** (enforced by `DigestDelivery @@unique([userId, digestDate])`) with a section per affected account. Subject: "Insight updates: 2 need your action". Body: per-account counts by bucket + patient initials + status for needs-action items only + deep link to the web view. Unsubscribe: signed token (HMAC over userId with `DIGEST_TOKEN_SECRET`, no expiry needed) → `GET /digest-unsubscribe?token=` flips `digestOptIn`. Transport: SMTP (nodemailer); failure → `DigestDelivery.status=FAILED`, one retry, logged; never blocks publish.
 
 ---
 
@@ -659,7 +660,7 @@ Framework: vitest + supertest (backend; ST core via docker), Playwright for 3 E2
 3. **Publish transaction:** mid-batch failure rolls back to zero changes (batch FAILED); concurrent publish → one 409; re-publish published batch → 409; account-move deactivates the old row + emits DEACTIVATED; deactivation default-off honored.
 4. **Parser fixtures:** every file in `/fixtures` produces its exact expected outcome (incl. BOM, win-1252, serial dates with no TZ shift, multi-sheet error, dup headers, dup referral_id with both row numbers, unknown status with mapping hint).
 
-**Unit:** normalizeName (suffixes, punctuation→space, hyphens; explicit cases: "GI, LLC", "GI LLC MD", "Smith-Jones Rheumatology"), accountMatcher (NPI>name>alias priority, collision rejection, did-you-mean), validation (18-status mapping, enum canonicalization, dates, caps), predicates (needsAction, newToday incl. republish behavior), digest assembly (PHI-minimization, one-per-day).
+**Unit:** normalizeName (suffixes, punctuation→space, hyphens; explicit cases: "GI, LLC", "GI LLC MD", "Smith-Jones Rheumatology"), accountMatcher (NPI>name>alias priority, collision rejection, did-you-mean), validation (18-status mapping, enum canonicalization, dates, caps), predicates (needsAction, newToday incl. republish behavior), digest assembly (data minimization: counts/initials/statuses only; one-per-day).
 **Integration:** upload→validate→preview→publish→GET /patients end-to-end; overview counts; user provisioning compensation; alias creation flow.
 **E2E (Playwright):** provider daily flow (login → needs-action → detail → sign-out); admin publish ritual (upload fixture → diff → publish → extension shows data); multi-account picker switch.
 **Flakiness rules:** dockerized ST core only; clock injection for staleness tests; no ordering-dependent assertions.
@@ -713,7 +714,7 @@ Ingestion: CSV+XLSX parse incl. BOM/win-1252/serial dates; missing columns fail 
 Publish: 409 on re-publish; rollback leaves zero changes; account-move deactivates old row; deactivation off by default + confirmation checkbox; diff preview in operator language; events written.
 Provider UI: loads <2s; needs-action banner + pinned group; counts = chips = filters synced; search works; DOB masked in list/full in detail; status explanations per §1.3; first-run card; staleness copy rules; account picker (multi-account); empty/error/skeleton states; a11y criteria (§12.7).
 Admin UI: overview cards correct; stepper states; batch history; users show lastLoginAt; alias collision rejected.
-Digest & ops: digest on publish (≤1/user/day, PHI-minimized, unsubscribe); publish-failure + zero-row + missed-deadline alerts fire.
+Digest & ops: digest on publish (≤1/user/day, data-minimized, unsubscribe); publish-failure + zero-row + missed-deadline alerts fire.
 Scope boundary: V1 runs on synthetic seed data only; no real patient data loaded; HIPAA workstream confirmed present in TODOS.md as the external-pilot blocker (§15).
 Docs & DX: quick start ≤30min on a clean machine; four docs exist and match behavior; `pnpm smoke` green.
 
@@ -721,7 +722,7 @@ Docs & DX: quick start ≤30min on a clean machine; four docs exist and match be
 
 ## Section 22: Schema-Freeze Blockers (open ops questions — do not freeze §10 against guesses)
 
-1. Obtain ≥3 real sample exports from the hospital sheet; profile every column; update §10 + the StatusMapping seed from reality. Owner: Insight operations admin.
+1. Obtain ≥3 **de-identified or synthetic schema-faithful** sample exports of the hospital sheet (real column headers, real status vocabulary, real formatting quirks — fake or scrubbed patient identifiers, consistent with §15's no-real-patient-data boundary); profile every column; update §10 + the StatusMapping seed from reality. Owner: Insight operations admin.
 2. Written answer: is the daily file cumulative or incremental? Until answered, `PUBLISH_DEACTIVATE_MISSING=false` stands (manual deactivation only).
 
 Build Steps 1–3 may proceed before these close; Steps 4+ should rebase §10/§1.2 on the samples if they contradict this contract.
