@@ -1341,6 +1341,12 @@ Test plan artifact: ~/.gstack/projects/InsightExtension/aaron-master-eng-review-
 | 71 | 3.5 | scripts/smoke.ts: signin → scoped /patients → cross-tenant 404 → bad upload 400 → publish 200→409 | Mechanical | P1 | Step 9 was nine manual checks with no commands | manual-only |
 | 72 | 3.5 | Publish preview in operator language ("3 newly visible to GI Medical...") + PHI-safe batch history (who/file/counts/result/failure reason) | Mechanical | P1 | publish is the trust moment; supportability needs batch history | row counts only |
 | 73 | 3.5 | Seed credentials labeled local-only; production first-admin bootstrap flow (no seeded admin in prod) | Mechanical | P1 | sample passwords leak into staging habits | seed everywhere |
+| 74 | GATE | UC1 RESOLVED — HIPAA baseline IN V1: BAA chain named, encryption-at-rest confirmed, PHI read-access audit events, session policy (12h idle, tightenable), retention policy, breach-response owner | USER (final gate) | — | user flipped D1 after 5 voices across 3 phases flagged critical | risk-register-only |
+| 75 | GATE | UC2 RESOLVED — web-view architecture + email digest IN V1: popup React app also served at URL (extension = wrapper/launcher); daily per-account digest ("N need your action" + deep link) | USER (final gate) | — | all 4 voices across Phases 1+2; de-risks blur-close, IT install blocks, pull-only habit | extension-only |
+| 76 | GATE | UC3 RESOLVED — health labels CUT to TODOS (trigger: 10+ accounts); minimal Overview page stays (account cards: active/new/needs-action/last publish/last login) | USER (final gate) | — | user accepted models' recommendation; PRD's own anti-analytics-graveyard warning | labels in V1 |
+
+## FINAL GATE OUTCOME (2026-06-11)
+**APPROVED** as the build contract. Taste defaults accepted: DOB masked (MM/DD/****) in list, full in detail; Inter font retained. Mode: SELECTIVE EXPANSION honored throughout. Implementation task #1: consolidated build-spec v0.3 (amendment 58). Schema-freeze blockers: (1) ≥3 real sample exports, (2) written ops answer on cumulative-vs-incremental.
 
 
 
