@@ -58,7 +58,9 @@ Lives in `packages/shared/src/statuses.ts`, consumed by backend and both fronten
 | Fulfillment in progress | Fulfillment/Delivery | Shipping | blue | no | The medication is being prepared for shipment. |
 | Medication shipped | Fulfillment/Delivery | Shipping | blue | no | The medication has been shipped and is in transit. |
 | Delivered | Fulfillment/Delivery | Shipping | emerald | no | Delivery has been confirmed. |
-| Closed | — | All | neutral | no | This case is no longer active. |
+| Closed | retains last phase | All | neutral | no | This case is no longer active. |
+
+`Closed` invariant: a row mapped to `CLOSED` is deactivated on publish (`isActive=false`, `DEACTIVATED` event); `workflowPhase` keeps its last known value (no `CLOSED` phase exists). Closed rows are excluded from Total active and all default views.
 
 Colors: neutral `#6B7280`, amber `#F59E0B`, indigo `#4F46E5`, emerald `#10B981`, blue `#3B82F6`. "PA denied" is deliberately NOT red — Insight is handling it; red would alarm office staff about something they don't own.
 
@@ -81,12 +83,13 @@ Colors: neutral `#6B7280`, amber `#F59E0B`, indigo `#4F46E5`, emerald `#10B981`,
 | Auth | SuperTokens — `supertokens-node` 18.x, `supertokens-web-js` 0.13.x (extension+web view), `supertokens-auth-react` 0.48.x (internal tool); core: `supertokens/supertokens-postgresql` docker image (dev), self-hosted or managed core (prod). **Never `try.supertokens.io`.** |
 | File parsing | `csv-parse` 5.x (CSV), **`exceljs` 4.x** (XLSX — replaces v0.2's `xlsx`, which is frozen at 0.18.5 on npm with CVE-2023-30533 + CVE-2024-22363), `iconv-lite` 0.6.x (Windows-1252 fallback decode), `yauzl` 3.x (XLSX zip-entry inspection / bomb guard) |
 | Validation | zod 3.x |
+| Uploads | multer 1.4.5-lts.x (+ @types/multer) |
 | Rate limiting | express-rate-limit 7.x |
 | Email | nodemailer 6.x (SMTP via env) |
 | Scheduler | node-cron 3.x (ops alerts) |
 | Frontends | React 18, Vite 5, Tailwind CSS 4 (`@tailwindcss/vite`) |
 | Extension build | `@crxjs/vite-plugin` 2.x (MV3 multi-entry, manifest handling) |
-| Tests | vitest 2.x + supertest 7.x (backend); Playwright (3 E2E flows, §18) |
+| Tests | vitest 2.x + supertest 7.x (backend); @playwright/test 1.4x (3 E2E flows, §18) |
 
 Packages per workspace are enumerated in §19 Step 1. Commit `pnpm-lock.yaml`.
 
@@ -162,15 +165,20 @@ import { prisma } from "./prisma";   // single shared client — never instantia
 async function buildClaims(supertokensId: string) {
   const user = await prisma.user.findUnique({
     where: { supertokensId },
-    include: { accounts: { select: { accountId: true } } },
+    include: { accounts: { include: { account: { select: { id: true, isActive: true } } } } },
   });
   if (!user || !user.isActive) return null;          // fail closed
   return {
     role: user.role,                                  // Prisma enum value
-    accountIds: user.accounts.map(a => a.accountId),  // [] for internal users
+    accountIds: user.accounts
+      .filter(a => a.account.isActive)                // deactivated ACCOUNTS drop out of claims
+      .map(a => a.account.id),                        // [] for internal users
     localUserId: user.id,
   };
 }
+// Account deactivation semantics: an inactive Account is excluded from claims (above),
+// from GET /me, rejected by accountScope even if a stale token still carries it
+// (accountScope re-checks Account.isActive), and excluded from upload matching (§8).
 
 // The fail-closed check lives in the signInPOST API override (NOT a thrown generic
 // error from createNewSession, which SuperTokens would surface as a 500):
@@ -199,6 +207,8 @@ if (role === "PROVIDER_STAFF") {
   if (!accountId || !Array.isArray(claims.accountIds) || !claims.accountIds.includes(accountId)) {
     return res.status(404).json({ error: "Not found" });   // 404, never 403 — no existence leak
   }
+  const account = await prisma.account.findUnique({ where: { id: accountId }, select: { isActive: true } });
+  if (!account?.isActive) return res.status(404).json({ error: "Not found" });  // stale claims on a deactivated account
   req.scopedAccountId = accountId;                          // non-empty string, asserted
 }
 ```
@@ -253,9 +263,10 @@ enum ProviderStatus {
 }
 
 model Account {
-  id          String   @id @default(uuid())
-  name        String   @unique
-  practiceNpi String?  @unique
+  id             String   @id @default(uuid())
+  name           String   @unique
+  normalizedName String   @unique   // maintained on create/edit via normalizeName(); collision → 409
+  practiceNpi    String?  @unique
   locations   String[]
   specialty   String?
   isActive    Boolean  @default(true)
@@ -291,6 +302,7 @@ model User {
   fileBatches   FileBatch[]
   auditLogs     AuditLog[]
   adoptionEvents AdoptionEvent[]
+  digestDeliveries DigestDelivery[]
 }
 
 model UserAccount {
@@ -363,6 +375,10 @@ model Referral {
   updatedAt        DateTime        @updatedAt
   events           ReferralStatusEvent[]
   @@unique([referralId, accountId])
+  // INVARIANT: hospital referral IDs are globally unique (PRD: "stable unique identifier").
+  // Enforced by a raw-SQL partial unique index in the migration:
+  //   CREATE UNIQUE INDEX referral_active_global ON "Referral"("referralId") WHERE "isActive" = true;
+  // Historical inactive rows may share a referralId (account-move history, §9.4).
   @@index([accountId, isActive, statusUpdatedAt])
   @@index([accountId, providerStatus])
 }
@@ -391,6 +407,17 @@ model AdoptionEvent {
   accountId String?
   createdAt DateTime @default(now())
   @@index([userId, createdAt])
+}
+
+model DigestDelivery {
+  id         String   @id @default(uuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+  digestDate DateTime @db.Date
+  status     String   // SENT | FAILED
+  attempts   Int      @default(0)
+  createdAt  DateTime @default(now())
+  @@unique([userId, digestDate])   // one aggregated digest per user per day, all their accounts in sections
 }
 
 model AuditLog {
@@ -459,13 +486,14 @@ export function normalizeName(name: string): string {
 }
 ```
 
-Matching priority (NPI-first — a typo'd name must not route PHI to the wrong practice):
+Matching priority (NPI-first — a typo'd name must not route patient data to the wrong practice). **Only `isActive` accounts participate in matching.**
 1. `practice_npi` exact match on `Account.practiceNpi` (when the file provides it)
 2. Exact `account_name` match on `Account.name`
-3. `normalizeName(account_name)` match on `AccountAlias.normalized`
-4. Unmatched → CRITICAL error with did-you-mean suggestions (Levenshtein ≤ 2 on normalized names/aliases)
+3. `normalizeName(account_name)` match on `Account.normalizedName`
+4. `normalizeName(account_name)` match on `AccountAlias.normalized`
+5. Unmatched → CRITICAL error with did-you-mean suggestions (Levenshtein ≤ 2 on normalized names/aliases)
 
-Aliases are NEVER auto-created. Resolving an unmatched name is an explicit admin action in the preview UI (shows account NPI + prescriber context), which creates the alias and re-validates.
+Collision integrity: `Account.normalizedName` and `AccountAlias.normalized` are each unique AND alias creation rejects (409, naming the conflict) any normalized value that equals another account's `normalizedName` — an alias can never shadow a different practice's name. Aliases are NEVER auto-created. Resolving an unmatched name is an explicit admin action in the preview UI (shows account NPI + prescriber context), which creates the alias and re-validates.
 
 ---
 
@@ -501,9 +529,9 @@ CSV: UTF-8 with BOM tolerated (`bom: true`); non-UTF-8 input is detected by stri
 | patientDob | `patient_dob` (DOB, Date of Birth) | YES |
 | medicationName | `medication_name` (Medication, Drug Name) | Recommended |
 | internalStatus | `internal_status` (Internal Status) | **YES** |
-| providerStatus | `provider_status` (Status) | No — optional override |
-| workflowPhase | `workflow_phase` (Phase) | No — derived from mapping; override allowed |
-| nextActionOwner | `next_action_owner` (Next Action, Action Owner) | No — derived from mapping; override allowed |
+| providerStatus | `provider_status` (Status) | No — optional override of the mapped status |
+| workflowPhase | `workflow_phase` (Phase) | No — IGNORED as an override: phase is ALWAYS derived from the (possibly overridden) provider status via §1.3. If present and contradicting the derived phase → WARNING naming both values |
+| nextActionOwner | `next_action_owner` (Next Action, Action Owner) | No — override allowed (it drives needs-action); overridden values are highlighted in the preview |
 | statusNote | `status_note` (Notes) | No (≤300 chars; shown provider-facing — keep controlled) |
 | statusUpdatedAt | `status_updated_at` (Last Updated) | YES |
 | schemaVersion | `schema_version` | No — when present, must be `v1` |
@@ -593,19 +621,15 @@ Tokens from §12.1. SuperTokens prebuilt login at `/auth` (do not restyle in V1)
 
 ## Section 14: Email Digest
 
-On publish, for each account with changes: enqueue one digest per provider user with `digestOptIn` (max one email per user per calendar day). Subject: "Insight updates for <Account>: 2 need your action". Body (PHI-minimized): counts by bucket + patient initials + status for needs-action items only + deep link to the web view. Footer unsubscribe link (`GET /digest-unsubscribe?token=` flips `digestOptIn`). Transport: SMTP env (nodemailer); failures logged + retried once; never block publish.
+On publish: collect provider users with `digestOptIn` whose accounts had changes; for each user, send **one aggregated digest per calendar day** (enforced by `DigestDelivery @@unique([userId, digestDate])`) with a section per affected account. Subject: "Insight updates: 2 need your action". Body (data-minimized): per-account counts by bucket + patient initials + status for needs-action items only + deep link to the web view. Unsubscribe: signed token (HMAC over userId with `DIGEST_TOKEN_SECRET`, no expiry needed) → `GET /digest-unsubscribe?token=` flips `digestOptIn`. Transport: SMTP (nodemailer); failure → `DigestDelivery.status=FAILED`, one retry, logged; never blocks publish.
 
 ---
 
-## Section 15: HIPAA Baseline (V1 scope — final-gate decision)
+## Section 15: V1 Scope Boundary — Internal Testing Only
 
-1. **BAA chain documented** in docs/architecture.md: hosting platform (managed Postgres with encryption-at-rest — Railway/RDS class), SMTP provider, SuperTokens (self-hosted core inside our infra avoids a third BAA). Signing them is an ops task tracked before pilot.
-2. **Encryption:** TLS everywhere (platform-terminated HTTPS; no plaintext listeners); Postgres encryption-at-rest confirmed on the chosen platform.
-3. **PHI access audit:** `AdoptionEvent(PATIENTS_FETCH, accountId)` per provider read + AuditLog rows for all admin mutations; both timestamped — satisfies the SOP's "all steps timestamp-logged."
-4. **Session policy:** 12h idle, sign-out control, no PHI in `chrome.storage`/localStorage (session tokens only), DOB masked in list views.
-5. **Retention:** FileBatch + ValidationError rows purged at 90 days (nightly job); Referral/event history retained for the pilot, policy revisited with compliance at scale.
-6. **Breach response owner:** named in docs/ops-runbook.md (Insight compliance officer per SOP) with a "wrong-account exposure" triage procedure (the account-move guard + matching rules exist to prevent it; the runbook covers it anyway).
-7. **No PHI in logs:** console logs carry IDs and counts, never names/DOBs.
+**V1 is tested internally at Insight only (user decision 2026-06-11, supersedes the earlier UC1 gate decision).** No external provider office touches the system, and internal testing uses the synthetic seed data — no real patient data is loaded in V1. Consequently the HIPAA/compliance workstream (BAA chain, encryption-at-rest attestation, retention policy, breach-response procedures, compliance review) is **out of V1 scope entirely** and lives in TODOS.md as the hard blocker for any external pilot or any load of real patient data.
+
+Engineering hygiene that happens to overlap with compliance stays in V1 on its own merits (it's already specified where it lives): fail-closed auth + account isolation (§4), audit/adoption event logging (§5), 12h idle session + sign-out (§4.6), DOB masked in list views (§12.3), no patient names/DOBs in console logs (§16), TLS via the hosting platform (§17). These are correctness and good practice, not compliance claims.
 
 ---
 
@@ -630,7 +654,7 @@ Structured console lines (`[upload] batch=... rows=... errors=... ms=...`) at up
 Framework: vitest + supertest (backend; ST core via docker), Playwright for 3 E2E flows. Fixtures in `/fixtures`. `pnpm test` runs unit+integration; `pnpm test:e2e` runs Playwright.
 
 **Ship-blocking suites (failures block any merge):**
-1. **Cross-tenant isolation:** sarah cannot fetch mike's patient (404); `X-Account-Id` outside claims → 404; provider with empty accountIds → 404; **undefined/missing claims → denied, never an unfiltered query**.
+1. **Cross-tenant isolation:** sarah cannot fetch mike's patient (404); `X-Account-Id` outside claims → 404; provider with empty accountIds → 404; **undefined/missing claims → denied, never an unfiltered query**; deactivated ACCOUNT → dropped from claims/`/me`, rejected by accountScope on stale tokens, excluded from upload matching; alias colliding with another account's normalizedName → 409 at creation.
 2. **Fail-closed auth:** orphan SuperTokens user cannot establish a session; deactivated user → 403 on next request; claims re-minted on refresh after account reassignment.
 3. **Publish transaction:** mid-batch failure rolls back to zero changes (batch FAILED); concurrent publish → one 409; re-publish published batch → 409; account-move deactivates the old row + emits DEACTIVATED; deactivation default-off honored.
 4. **Parser fixtures:** every file in `/fixtures` produces its exact expected outcome (incl. BOM, win-1252, serial dates with no TZ shift, multi-sheet error, dup headers, dup referral_id with both row numbers, unknown status with mapping hint).
@@ -653,12 +677,14 @@ Framework: vitest + supertest (backend; ST core via docker), Playwright for 3 E2
 **Step 7 — Accounts/Users/Overview/Batches APIs.** §6 + §7 internal routes. *Verify:* provisioning compensation test green; overview counts correct.
 **Step 8 — Extension.** §11 manifest + crxjs config; §12 components/states; built also as web target. *Verify:* load unpacked with pre-derived ID; login as sarah; only GI Medical patients; filters/search/detail/picker/sign-out work; states render (network-off shows Retry).
 **Step 9 — Internal tool.** §13 pages. *Verify:* full upload→validate→preview→publish ritual on fixtures; extension reflects publish.
-**Step 10 — Digest + alerts + docs.** §14, §16, the four docs + README, smoke.ts. *Verify:* digest sent to mailhog (compose service) on publish; alert fires on simulated missed publish; `pnpm smoke` green.
+**Step 10 — Digest + alerts + docs.** §14, §16, the four docs + README, smoke.ts. *Verify:* digest visible in the Mailpit UI/API on publish (one per user with account sections); alert fires on simulated missed publish; `pnpm smoke` green.
 **Step 11 — Full verification.** §21 checklist + `pnpm test && pnpm test:e2e && pnpm smoke`.
 
 ---
 
-## Section 20: Environment Variables (`.env.example` ships working dev values)
+## Section 20: Environment Variables
+
+The block below shows the POST-Step-1 state of `.env.example` (committed after `pnpm gen:extension-key` replaces the two `<derived…>` extension entries with real values — §11/§19 Step 1). After that one-time step, clones have zero placeholders.
 
 ```
 DATABASE_URL=postgresql://postgres:password@localhost:5432/insight_pharmacy
@@ -688,7 +714,7 @@ Publish: 409 on re-publish; rollback leaves zero changes; account-move deactivat
 Provider UI: loads <2s; needs-action banner + pinned group; counts = chips = filters synced; search works; DOB masked in list/full in detail; status explanations per §1.3; first-run card; staleness copy rules; account picker (multi-account); empty/error/skeleton states; a11y criteria (§12.7).
 Admin UI: overview cards correct; stepper states; batch history; users show lastLoginAt; alias collision rejected.
 Digest & ops: digest on publish (≤1/user/day, PHI-minimized, unsubscribe); publish-failure + zero-row + missed-deadline alerts fire.
-HIPAA baseline: §15 items 1–7 verifiably in place.
+Scope boundary: V1 runs on synthetic seed data only; no real patient data loaded; HIPAA workstream confirmed present in TODOS.md as the external-pilot blocker (§15).
 Docs & DX: quick start ≤30min on a clean machine; four docs exist and match behavior; `pnpm smoke` green.
 
 ---
@@ -704,4 +730,8 @@ Build Steps 1–3 may proceed before these close; Steps 4+ should rebase §10/§
 
 ## Changelog from v0.2
 
-All 76 review decisions merged (audit trail: GSTACK REVIEW REPORT in the v0.2 file). Headlines: fail-closed session claims + request-time isActive (cross-tenant leak fix); User↔Account many-to-many + account picker; 18-status canon + backend mapping layer (internal_status required); transactional/locked/idempotent publish with account-move guard and default-off deactivation; ReferralStatusEvent history + server-side predicates; NPI-first matching, alias hygiene, never auto-alias; exceljs replaces xlsx (CVEs); parser contract (BOM/encodings/serial dates/sheet rule/caps); error copy + rawValue + errors.csv; UI hierarchy restructure + state matrices + SearchBar + sign-out + first-run card + masked DOB; docker-compose + pinned manifest key + seeds split + version pinning + tsx + fixtures + vitest; docs as a build step; web view + email digest (UC2); HIPAA baseline §15 (UC1); health labels cut to TODOS (UC3); rate limiting + password policy; ops alerting; production bootstrap.
+All 76 review decisions merged (audit trail: GSTACK REVIEW REPORT in the v0.2 file). Headlines: fail-closed session claims + request-time isActive (cross-tenant leak fix); User↔Account many-to-many + account picker; 18-status canon + backend mapping layer (internal_status required); transactional/locked/idempotent publish with account-move guard and default-off deactivation; ReferralStatusEvent history + server-side predicates; NPI-first matching, alias hygiene, never auto-alias; exceljs replaces xlsx (CVEs); parser contract (BOM/encodings/serial dates/sheet rule/caps); error copy + rawValue + errors.csv; UI hierarchy restructure + state matrices + SearchBar + sign-out + first-run card + masked DOB; docker-compose + pinned manifest key + seeds split + version pinning + tsx + fixtures + vitest; docs as a build step; web view + email digest (UC2); health labels cut to TODOS (UC3); rate limiting + password policy; ops alerting; production bootstrap.
+
+**Post-gate user decision (2026-06-11, supersedes UC1):** V1 is internal-testing only on synthetic data — HIPAA workstream cut from V1 entirely, parked in TODOS.md as the hard blocker for any external pilot or real-patient-data load (§15).
+
+**Codex review rounds on this document:** round 1 — 20 findings (7 P1) fixed: publish two-phase failure handling, signInPOST fail-closed mapping, signup/reset API-vs-function scoping, cookie/site topology, Mailpit service, extension-key generation step, exactly-one-sheet rule, schema FKs, date boundary convention, healthz contract, Express wiring, iconv-lite/yauzl, step 4/5 ownership, updateMany lock, client init configs. Round 2 — 10 findings (2 P1) fixed: inactive-account enforcement end-to-end, alias↔account normalizedName collision integrity, Closed-status invariant, phase-override removal, global referralId partial unique index, DigestDelivery model + signed unsubscribe tokens, env placeholder wording, Mailpit naming, multer/Playwright pinning. (Round-2 retention-job finding mooted by the HIPAA cut — retention now lives with the TODOS workstream.)
