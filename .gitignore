@@ -1,0 +1,13 @@
+# dependencies & builds
+node_modules/
+dist/
+*.zip
+
+# environment & secrets
+.env
+.env.*
+!.env.example
+
+# local tooling
+.claude/worktrees/
+*.log
