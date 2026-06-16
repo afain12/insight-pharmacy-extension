@@ -1,7 +1,7 @@
 # Insight Specialty Pharmacy Extension — V1 Comprehensive Plan
 
 Date: 2026-06-11 · Status: **APPROVED** (full /autoplan review + 3 codex review rounds, converged)
-Build contract: [`BUILD-SPEC-v0.3.md`](../BUILD-SPEC-v0.3.md) (supersedes the v0.2 spec)
+Build contract: [`BUILD-SPEC-v0.4.md`](../BUILD-SPEC-v0.4.md) — **current**; swaps SuperTokens → Better Auth and PostgreSQL → self-hosted MySQL 8 per [`hosting-and-auth-migration-strategy.md`](hosting-and-auth-migration-strategy.md), with every v0.3 security invariant preserved. (Supersedes [`BUILD-SPEC-v0.3.md`](../BUILD-SPEC-v0.3.md), which supersedes v0.2.) The approved plan below is unchanged in substance; only the auth implementation and DB engine differ.
 Decision audit trail (all 76 decisions): GSTACK REVIEW REPORT appended to `Insight Specialty Pharmacy Extension PRD Structure v0_2.md`
 
 ---
@@ -21,7 +21,7 @@ A daily confidence layer for provider offices, built on SOP-SPI-001 v2.0's four-
 | # | Decision |
 |---|---|
 | D2 | Canonical taxonomy = 18 statuses (spec's 15 + Physician enrollment pending, Telehealth no-show, Address confirmation pending), backend mapping layer, `internal_status` required in the file |
-| D3 | User↔Account is many-to-many (`UserAccount` join table, `accountIds[]` claims, account picker) |
+| D3 | User↔Account is many-to-many (`UserAccount` join table, `accountIds` resolved per request, account picker) |
 | D4→UC3 | Admin Overview page in V1; health labels (growing/stalled/friction/at-risk) cut to TODOS (trigger: 10+ accounts) |
 | UC2 | Web-view architecture + email digest in V1; extension stays the primary face |
 | Final | HIPAA cut from V1 entirely (internal-only testing, synthetic data); workstream → TODOS P0 |
@@ -29,19 +29,19 @@ A daily confidence layer for provider offices, built on SOP-SPI-001 v2.0's four-
 
 ## 3. Architecture (summary — full detail in BUILD-SPEC §3–§5)
 
-pnpm monorepo: `packages/shared` (canonical status table) · `packages/backend` (Express + Prisma/PostgreSQL + SuperTokens, fail-closed claims, rate-limited auth) · `packages/extension` (React MV3 popup + web-view build target) · `packages/internal-tool` (React admin). Dev infra: docker-compose (postgres:15, SuperTokens core, Mailpit). Auth: header tokens (extension) / cookies (web view + internal tool, same-site subdomain topology in prod).
+pnpm monorepo: `packages/shared` (canonical status table) · `packages/backend` (Express + Prisma/MySQL + **Better Auth in-process**, fail-closed DB-resolved authorization, rate-limited auth) · `packages/extension` (React MV3 popup + web-view build target) · `packages/internal-tool` (React admin). Dev infra: docker-compose (`mysql:8`, Mailpit) — no separate auth-service container. Auth: bearer tokens (extension) / cookies (web view + internal tool, same-site subdomain topology in prod).
 
 Load-bearing invariants:
-- **Fail-closed isolation:** missing/undefined session claims are denied — never an unfiltered query; cross-account access returns 404; deactivated users and accounts lose access on the next request.
+- **Fail-closed isolation:** an invalid/absent Better Auth session or a missing local `User` is denied (401) — never an unfiltered query; `role`/`accountIds` are resolved from the DB on every request (no token claims, so no stale-claims window); cross-account access returns 404; deactivated users and accounts lose access on the next request.
 - **Publish safety:** conditional-update lock (`VALIDATED→PUBLISHING→PUBLISHED`), single transaction with two-phase failure handling, account-move guard, bulk deactivation disabled until ops confirms file cadence in writing.
 - **Matching safety:** NPI-first matching; `Account.normalizedName` and alias normalization are collision-checked; aliases never auto-created.
-- **Date discipline:** date-only fields are `YYYY-MM-DD` strings at every boundary (`@db.Date` in Postgres) — a DOB must never shift across timezones.
+- **Date discipline:** date-only fields are `YYYY-MM-DD` strings at every boundary (`@db.Date` → MySQL `DATE`) — a DOB must never shift across timezones.
 
 ## 4. Build sequence (BUILD-SPEC §19 — each step has a verification gate)
 
 1. **Monorepo + infra** — workspace, pinned deps, docker-compose, `gen:extension-key` (deterministic extension ID baked into `.env.example`)
 2. **Schema + foundation seed** — canonical Prisma schema; accounts/aliases/status-mapping seeds
-3. **Backend core + auth** — SuperTokens fail-closed claims, `resolveLocalUser`, rate limits, user + referral seeds
+3. **Backend core + auth** — Better Auth in-process (`auth.ts`), fail-closed DB-resolved `resolveLocalUser`, rate limits, user + referral seeds
 4. **Ingestion** — parser contract (BOM/win-1252/serial dates/one-sheet rule/caps), validation + error copy, NPI-first matching
 5. **Publish** — locked transactional publish + account-first diff preview
 6. **Provider API** — scoped patients + summary + server-side predicates (`needsAction`, `newToday`)
