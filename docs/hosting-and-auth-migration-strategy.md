@@ -11,12 +11,14 @@ Use a HIPAA-capable hosting boundary and move authentication from SuperTokens to
 Recommended first production stack:
 
 - App runtime: Fly.io HIPAA compliance package
-- Database: Neon Postgres Scale plan with HIPAA enabled
-- Auth: Better Auth self-hosted inside the backend, storing users and sessions in the same covered Postgres database
+- Database: existing/self-hosted MySQL, if it can be placed inside the HIPAA-covered production boundary with documented backups, restore testing, access controls, and encryption
+- Auth: Better Auth self-hosted inside the backend, storing users and sessions in the same covered MySQL database
 - Email: no PHI-bearing email until a HIPAA-capable email vendor and BAA are selected
 - Current Railway usage: keep only for local-style development or synthetic/internal testing unless Railway's HIPAA threshold is accepted
 
 This replaces the SuperTokens assumption in `BUILD-SPEC-v0.3.md` for production planning. The build spec still contains useful security invariants: fail-closed auth, account scoping, masked DOB in list views, no PHI logs, rate limiting, audit events, and production bootstrap. Those invariants should remain, but the auth implementation should be Better Auth rather than SuperTokens.
+
+This also updates the earlier Postgres/Neon default. Neon is not required if the team already has operational comfort with a self-hosted MySQL database. The durable requirement is a BAA-covered relational database with reliable operations, not a specific Postgres vendor.
 
 ## Why this change
 
@@ -25,11 +27,13 @@ The current spec names SuperTokens as the auth layer. SuperTokens is workable, b
 The preferred direction is now:
 
 - Use an open-source auth library inside the application.
-- Store auth state in the same HIPAA-covered Postgres database as the application.
+- Store auth state in the same HIPAA-covered relational database as the application.
 - Avoid hosted auth vendors entirely for V1.
 - Keep the vendor/BAA chain limited to the infrastructure providers that actually store or process PHI.
 
-Better Auth fits this better than SuperTokens for this project because it runs inside the TypeScript backend, supports PostgreSQL, supports cookie sessions, and has bearer-token support for API clients such as a Chrome extension.
+Better Auth fits this better than SuperTokens for this project because it runs inside the TypeScript backend, supports MySQL and PostgreSQL, supports cookie sessions, and has bearer-token support for API clients such as a Chrome extension.
+
+LabAide/Natalie is the closest internal precedent: it already uses a MySQL backend and ChatGPT-style query history. That is meaningful experience. For this project, the cheapest and fastest path should build on that operating comfort unless HIPAA boundary or database reliability requirements make a managed database more practical.
 
 Important compliance caveat: self-hosting auth does not make the product HIPAA-compliant by itself. It only removes a hosted auth vendor from the compliance chain. HIPAA still requires BAAs, access controls, auditability, risk analysis, retention rules, breach response procedures, and operational safeguards.
 
@@ -49,7 +53,7 @@ Because this is PHI/ePHI once real patient data is loaded, the repo's existing P
 
 ## Vendor comparison
 
-### Recommended: Fly.io + Neon + Better Auth
+### Recommended: Fly.io + self-hosted MySQL + Better Auth
 
 This is the best balance of fast, cheap, and operationally understandable.
 
@@ -61,11 +65,11 @@ Use Fly.io for:
 - Background/cron jobs if needed
 - Optional same-org service for file-processing workers
 
-Use Neon for:
+Use self-hosted MySQL for:
 
-- PostgreSQL application database
+- Application database
 - Better Auth user/session tables
-- Prisma application tables
+- Prisma application tables, using Prisma's MySQL provider
 - Audit logs
 - Uploaded batch metadata and validation errors
 
@@ -81,37 +85,70 @@ Current source checks:
 
 - Fly.io says its HIPAA/BAA compliance package is available for HIPAA-compliant workloads and is priced at $99/month on its pricing page.
 - Fly.io provides a pre-signed BAA flow through its compliance documents.
-- Neon says HIPAA is a self-serve feature on the Scale plan, currently with no additional HIPAA charge, though it notes a future 15% surcharge may apply.
-- Better Auth documents PostgreSQL support, DB-backed users/sessions, cookie sessions, bearer token auth, and 2FA plugins.
+- Better Auth documents MySQL support, DB-backed users/sessions, cookie sessions, bearer token auth, and 2FA plugins.
+- Prisma documents support for self-hosted MySQL/MariaDB through the `mysql` provider.
 
 Key links:
 
 - Fly pricing: https://fly.io/pricing/
 - Fly compliance: https://fly.io/compliance
 - Fly healthcare production guide: https://fly.io/docs/blueprints/going-to-production-with-healthcare-apps/
-- Neon HIPAA: https://neon.com/docs/security/hipaa
-- Neon pricing: https://neon.com/pricing
 - Better Auth docs: https://www.better-auth.com/docs
-- Better Auth PostgreSQL adapter: https://better-auth.com/docs/adapters/postgresql
+- Better Auth MySQL adapter: https://www.better-auth.com/docs/adapters/mysql
 - Better Auth bearer plugin: https://better-auth.com/docs/plugins/bearer
 - Better Auth sessions: https://www.better-auth.com/docs/concepts/session-management
 - Better Auth 2FA: https://www.better-auth.com/docs/plugins/2fa
+- Prisma MySQL connector: https://www.prisma.io/docs/orm/core-concepts/supported-databases/mysql
 
 Pros:
 
 - Lower starting cost than Render HIPAA or Railway HIPAA.
 - No separate hosted auth vendor.
-- Postgres remains the only persistent data store.
-- Matches the existing Express/Prisma/Postgres direction.
+- Builds on the team's existing MySQL operating experience.
+- Keeps the persistent data store familiar instead of introducing Neon/Postgres.
+- Matches the existing Express/Prisma direction with a database provider change from Postgres to MySQL.
 - Supports the Chrome extension via bearer tokens.
 - Keeps deployment closer to a simple app-hosting model than AWS/GCP.
 
 Cons:
 
-- More DevOps responsibility than Render.
-- Need to be disciplined about secrets, logs, backups, regions, and admin access.
-- Need to confirm Neon/Fly BAA details before production PHI.
+- More database operations responsibility than a managed database.
+- Need to document MySQL backups, restore testing, upgrades, monitoring, encryption, and admin access.
+- Need to confirm that the MySQL host and storage live inside a BAA-covered production boundary before PHI.
 - Need a HIPAA-capable email vendor before sending patient-specific digests.
+
+### Optional managed-database fallback: Fly.io + Neon + Better Auth
+
+Neon should remain an option, not the default.
+
+Use Neon only if:
+
+- The self-hosted MySQL environment cannot be brought into the HIPAA-covered boundary.
+- Backup/restore, uptime, or database administration would distract from getting the pharmacy pilot live.
+- The team decides managed Postgres is worth the additional vendor and migration work.
+
+Current source checks:
+
+- Neon says HIPAA is a self-serve feature on the Scale plan, currently with no additional HIPAA charge, though it notes a future 15% surcharge may apply.
+- Better Auth and Prisma both support PostgreSQL if the team later chooses that path.
+
+Key links:
+
+- Neon HIPAA: https://neon.com/docs/security/hipaa
+- Neon pricing: https://neon.com/pricing
+- Better Auth PostgreSQL adapter: https://better-auth.com/docs/adapters/postgresql
+
+Pros:
+
+- Managed database operations.
+- Clear HIPAA self-serve flow on the supported plan.
+- Good fallback if self-hosted MySQL is operationally risky.
+
+Cons:
+
+- Introduces a database vendor the team does not currently know.
+- Requires adapting the product database direction back to Postgres.
+- Adds another BAA/vendor relationship.
 
 ### Alternative: Render HIPAA
 
@@ -140,7 +177,7 @@ Pros:
 
 - Easiest migration path from a Railway-like mental model.
 - Managed database and app hosting are in one platform.
-- Less deployment complexity than Fly + Neon.
+- Less deployment complexity than Fly plus a separately operated database.
 
 Cons:
 
@@ -209,12 +246,13 @@ Extension strategy:
 
 Database strategy:
 
-- One production Postgres database.
-- One staging/synthetic Postgres database.
+- One production MySQL database.
+- One staging/synthetic MySQL database.
 - No PHI in development databases.
 - Better Auth tables live in the same database as the application tables.
 - Prisma migrations own application tables.
 - Better Auth CLI or generated schema owns auth tables, but migrations must be reviewed and committed like app migrations.
+- Do not put PHI in the existing MySQL instance until the host, storage, backups, and access paths are confirmed inside the HIPAA-covered production boundary.
 
 ## SuperTokens to Better Auth migration
 
@@ -376,7 +414,7 @@ Exit criteria:
 Goal: prove auth and authorization behavior before hosting.
 
 - Add Better Auth packages.
-- Configure PostgreSQL adapter.
+- Configure MySQL adapter.
 - Generate/review auth tables.
 - Mount Better Auth under `/auth`.
 - Implement session middleware.
@@ -400,7 +438,7 @@ Exit criteria:
 Goal: validate hosting without PHI.
 
 - Create Fly organization/project for staging.
-- Create Neon non-HIPAA or HIPAA staging database depending on budget.
+- Create a staging MySQL database inside the same hosting model, or use synthetic-only local/Railway development if staging is not BAA-covered.
 - Deploy backend and frontends.
 - Configure domain names.
 - Configure Better Auth secret.
@@ -422,7 +460,7 @@ Exit criteria:
 Goal: complete the minimum compliance gate before any real patient data.
 
 - Sign Fly BAA or selected app-host BAA.
-- Sign Neon BAA or selected database BAA.
+- Confirm MySQL host coverage under the selected BAA, or sign the selected managed database BAA.
 - Select and sign BAA for any email/SMS/logging/support vendor that may touch PHI.
 - Confirm encryption at rest and TLS in transit.
 - Create production organization separate from staging.
@@ -466,7 +504,7 @@ Exact names can change during implementation, but these concepts are required:
 
 ```text
 NODE_ENV=production
-DATABASE_URL=...
+DATABASE_URL=mysql://...
 BETTER_AUTH_SECRET=...
 BETTER_AUTH_URL=https://api.insightpharmacy.example
 API_ORIGIN=https://api.insightpharmacy.example
@@ -486,7 +524,7 @@ NO_PHI_LOGS=true
 Before real PHI:
 
 - Signed BAA with app host.
-- Signed BAA with database provider.
+- Signed BAA with database provider or documented proof that the self-hosted MySQL host/storage/backups are inside the app-host BAA boundary.
 - Signed BAA with email vendor if PHI appears in email.
 - Signed BAA with logging/monitoring vendor if logs may include PHI.
 - No PHI in logs, metrics labels, traces, resource names, branch names, database names, or support tickets.
@@ -543,7 +581,7 @@ Do not log:
 ## Open decisions
 
 - Final app host: Fly.io vs Render.
-- Final database host: Neon vs host-integrated Postgres.
+- Final database host: existing/self-hosted MySQL vs managed fallback.
 - Final email vendor for PHI-capable digests.
 - Whether extension pilot is side-loaded, private Chrome Web Store, or public listing.
 - Whether internal admins require TOTP on day one or before first external pilot.
@@ -555,10 +593,10 @@ Do not log:
 2. Update `TODOS.md` P0 HIPAA item to reference "auth stack" instead of "SuperTokens core".
 3. Update build steps to remove SuperTokens Core from local Docker.
 4. Add Better Auth fail-closed test cases to the test plan.
-5. Add a deployment runbook for Fly + Neon.
+5. Add a deployment runbook for Fly + self-hosted MySQL.
 
 ## Bottom line
 
-The cheapest credible path is not a hosted auth provider and not Railway HIPAA. It is a small HIPAA-covered app/database boundary with auth running inside the app.
+The cheapest credible path is not a hosted auth provider and not Railway HIPAA. It is a small HIPAA-covered app/database boundary with auth running inside the app and data stored in a database the team already knows how to operate.
 
-Start with Fly.io + Neon + Better Auth. Keep Railway for synthetic development only. Move to Render if simplicity becomes more important than monthly cost. Move to AWS/GCP only when the business is ready for more cloud operations.
+Start with Fly.io + self-hosted MySQL + Better Auth if the MySQL environment can be covered and operated safely. Keep Neon only as the managed-database fallback, Railway for synthetic development only, Render if simplicity becomes more important than monthly cost, and AWS/GCP only when the business is ready for more cloud operations.
